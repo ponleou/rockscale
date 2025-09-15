@@ -393,37 +393,31 @@ __global__ void linearColumnInterpolate(unsigned char *rowInterpolated, const in
     }
 }
 
-void producer(VideoFFmpeg &video)
+void bilinearInterpolation(const AVFrame *frame, int scale, hipStream_t &stream, uint8_t *&y, uint8_t *&u, uint8_t *&v)
 {
-    video.startDecode();
-}
-
-void consumer(VideoFFmpeg &video, int upscaleMulti)
-{
-    AVFrame *frame = video.getFrame(AV_PIX_FMT_YUV420P);
     int width = frame->width;
     int height = frame->height;
-    int linesize = frame->linesize[0];
 
     // divide 2 and ceil
     int chromaWidth = (width + 1) / 2;
     int chromaHeight = (height + 1) / 2;
 
-    hipStream_t stream;
-    HIP_CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
-
     uint8_t *YPlane = frame->data[0];
     uint8_t *UPlane = frame->data[1];
     uint8_t *VPlane = frame->data[2];
 
+    int YLinesize = frame->linesize[0];
+    int ULinesize = frame->linesize[1];
+    int VLinesize = frame->linesize[2];
+
     // only index that has a "next" row or column can interpolate, so the last col of any row, and last row of any col will be a straight map
     // a -1 because width and height is overlapping the very last index
-    int newWidth = ((width - 1) * upscaleMulti) + 1;
-    int newHeight = ((height - 1) * upscaleMulti) + 1;
+    int newWidth = ((width - 1) * scale) + 1;
+    int newHeight = ((height - 1) * scale) + 1;
     int newPlaneSize = newWidth * newHeight;
     // same idea here
-    int newChromaWidth = ((chromaWidth - 1) * upscaleMulti) + 1;
-    int newChromaHeight = ((chromaHeight - 1) * upscaleMulti) + 1;
+    int newChromaWidth = ((chromaWidth - 1) * scale) + 1;
+    int newChromaHeight = ((chromaHeight - 1) * scale) + 1;
     int newChromaPlaneSize = newChromaWidth * newChromaHeight;
 
     uint8_t *hipYPlane{};
@@ -448,36 +442,76 @@ void consumer(VideoFFmpeg &video, int upscaleMulti)
 
     int threadsPerBlock = 256;
 
-    // TODO: double check this, pretty sure the threadcount was supposed to be linesize
-    int numBlocks = (linesize * height + threadsPerBlock - 1) / threadsPerBlock;
-    void *args[] = {&hipYPlane, &scaledYPlane, &linesize, &width, &height, &upscaleMulti};
-    HIP_CHECK(hipLaunchKernel((const void *)linearRowInterpolate, dim3(numBlocks), dim3(threadsPerBlock), args, 0, stream));
+    int rowThreadCountY = YLinesize * height;
+    int rowNumBlocksY = ceil((float)rowThreadCountY / (float)threadsPerBlock);
+    void *rowArgsY[] = {&hipYPlane, &scaledYPlane, &YLinesize, &width, &height, &scale};
+    HIP_CHECK(hipLaunchKernel((const void *)linearRowInterpolate, dim3(rowNumBlocksY), dim3(threadsPerBlock), rowArgsY, 0, stream));
+
+    int rowThreadCountU = ULinesize * chromaHeight;
+    int rowNumBlocksU = ceil((float)rowThreadCountU / (float)threadsPerBlock);
+    void *rowArgsU[] = {&hipUPlane, &scaledUPlane, &ULinesize, &chromaWidth, &chromaHeight, &scale};
+    HIP_CHECK(hipLaunchKernel((const void *)linearRowInterpolate, dim3(rowNumBlocksU), dim3(threadsPerBlock), rowArgsU, 0, stream));
+
+    int rowThreadCountV = VLinesize * chromaHeight;
+    int rowNumBlocksV = ceil((float)rowThreadCountV / (float)threadsPerBlock);
+    void *rowArgsV[] = {&hipVPlane, &scaledVPlane, &VLinesize, &chromaWidth, &chromaHeight, &scale};
+    HIP_CHECK(hipLaunchKernel((const void *)linearRowInterpolate, dim3(rowNumBlocksV), dim3(threadsPerBlock), rowArgsV, 0, stream));
 
     HIP_CHECK(hipStreamSynchronize(stream));
 
-    int newNumBlocks = (newWidth * height + threadsPerBlock - 1) / threadsPerBlock;
-    void *args2[] = {&scaledYPlane, &newWidth, &newHeight, &upscaleMulti};
-    HIP_CHECK(hipLaunchKernel((const void *)linearColumnInterpolate, dim3(newNumBlocks), dim3(threadsPerBlock), args2, 0, stream));
+    int colThreadCountY = newWidth * height;
+    int colNumBlocksY = ceil((float)colThreadCountY / (float)threadsPerBlock);
+    void *colArgsY[] = {&scaledYPlane, &newWidth, &newHeight, &scale};
+    HIP_CHECK(hipLaunchKernel((const void *)linearColumnInterpolate, dim3(colNumBlocksY), dim3(threadsPerBlock), colArgsY, 0, stream));
+
+    int colThreadCountU = newChromaWidth * chromaHeight;
+    int colNumBlocksU = ceil((float)colThreadCountU / (float)threadsPerBlock);
+    void *colArgsU[] = {&scaledUPlane, &newChromaWidth, &newChromaHeight, &scale};
+    HIP_CHECK(hipLaunchKernel((const void *)linearColumnInterpolate, dim3(colNumBlocksU), dim3(threadsPerBlock), colArgsU, 0, stream));
+
+    int colThreadCountV = newChromaWidth * chromaHeight;
+    int colNumBlocksV = ceil((float)colThreadCountV / (float)threadsPerBlock);
+    void *colArgsV[] = {&scaledVPlane, &newChromaWidth, &newChromaHeight, &scale};
+    HIP_CHECK(hipLaunchKernel((const void *)linearColumnInterpolate, dim3(colNumBlocksV), dim3(threadsPerBlock), colArgsV, 0, stream));
 
     HIP_CHECK(hipStreamSynchronize(stream));
 
-    uint8_t *hostScaledYPlane = new uint8_t[newPlaneSize];
-    HIP_CHECK(hipMemcpy(hostScaledYPlane, scaledYPlane, newPlaneSize * sizeof(uint8_t), hipMemcpyDeviceToHost));
+    y = new uint8_t[newPlaneSize];
+    HIP_CHECK(hipMemcpy(y, scaledYPlane, newPlaneSize * sizeof(uint8_t), hipMemcpyDeviceToHost));
+
+    u = new uint8_t[newChromaPlaneSize];
+    HIP_CHECK(hipMemcpy(u, scaledUPlane, newChromaPlaneSize * sizeof(uint8_t), hipMemcpyDeviceToHost));
+
+    v = new uint8_t[newChromaPlaneSize];
+    HIP_CHECK(hipMemcpy(v, scaledUPlane, newChromaPlaneSize * sizeof(uint8_t), hipMemcpyDeviceToHost));
 
     // DEBUG
-    // {
-    //     // Final dimensions
-    //     int finalWidth = ((width - 1) * upscaleMulti) + 1;
-    //     int finalHeight = ((height - 1) * upscaleMulti) + 1;
+    {
+        // Final dimensions
+        int finalWidth = ((width - 1) * scale) + 1;
+        int finalHeight = ((height - 1) * scale) + 1;
 
-    //     // Create PGM image
-    //     FILE *pgmFile = fopen("output.pgm", "wb");
-    //     fprintf(pgmFile, "P5\n%d %d\n255\n", finalWidth, finalHeight);
-    //     fwrite(hostScaledYPlane, sizeof(uint8_t), finalWidth * finalHeight, pgmFile);
-    //     fclose(pgmFile);
+        int chromaFinalWidth = ((chromaWidth - 1) * scale) + 1;
+        int chromaFinalHeight = ((chromaHeight - 1) * scale) + 1;
 
-    //     cout << "Created " << finalWidth << "x" << finalHeight << " image" << endl;
-    // }
+        // Create PGM image
+        FILE *pgmFileY = fopen("outputy.pgm", "wb");
+        fprintf(pgmFileY, "P5\n%d %d\n255\n", finalWidth, finalHeight);
+        fwrite(y, sizeof(uint8_t), finalWidth * finalHeight, pgmFileY);
+        fclose(pgmFileY);
+
+        FILE *pgmFileU = fopen("outputu.pgm", "wb");
+        fprintf(pgmFileU, "P5\n%d %d\n255\n", chromaFinalWidth, chromaFinalHeight);
+        fwrite(u, sizeof(uint8_t), chromaFinalWidth * chromaFinalHeight, pgmFileU);
+        fclose(pgmFileU);
+
+        FILE *pgmFileV = fopen("outputv.pgm", "wb");
+        fprintf(pgmFileV, "P5\n%d %d\n255\n", chromaFinalWidth, chromaFinalHeight);
+        fwrite(v, sizeof(uint8_t), chromaFinalWidth * chromaFinalHeight, pgmFileV);
+        fclose(pgmFileV);
+
+        cout << "Created " << finalWidth << "x" << finalHeight << " image" << endl;
+    }
 
     HIP_CHECK(hipFree(hipYPlane));
     HIP_CHECK(hipFree(hipUPlane));
@@ -485,9 +519,27 @@ void consumer(VideoFFmpeg &video, int upscaleMulti)
     HIP_CHECK(hipFree(scaledYPlane));
     HIP_CHECK(hipFree(scaledUPlane));
     HIP_CHECK(hipFree(scaledVPlane));
-    HIP_CHECK(hipStreamDestroy(stream));
+}
 
-    delete[] hostScaledYPlane;
+void producer(VideoFFmpeg &video)
+{
+    video.startDecode();
+}
+
+void consumer(VideoFFmpeg &video, int scale)
+{
+    AVFrame *frame = video.getFrame(AV_PIX_FMT_YUV420P);
+
+    hipStream_t stream;
+    HIP_CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
+
+    uint8_t *Y_output;
+    uint8_t *U_output;
+    uint8_t *V_output;
+    bilinearInterpolation(frame, scale, stream, Y_output, U_output, V_output);
+
+    HIP_CHECK(hipStreamDestroy(stream));
+    delete[] Y_output;
 }
 
 int main(int argc, char *argv[])
