@@ -1,11 +1,11 @@
-// #include <hip/hip_runtime.h>
-// #include <hip/hip_runtime_api.h>
 extern "C"
 {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 }
 
+#include <hip/hip_runtime.h>
+#include <hip/hip_runtime_api.h>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -27,6 +27,19 @@ using std::queue;
 using std::string;
 using std::unique_lock;
 using std::vector;
+
+#define HIP_CHECK(expression)                 \
+    {                                         \
+        const hipError_t status = expression; \
+        if (status != hipSuccess)             \
+        {                                     \
+            cerr << "HIP error "              \
+                 << status << ": "            \
+                 << hipGetErrorString(status) \
+                 << " at " << __FILE__ << ":" \
+                 << __LINE__ << std::endl;    \
+        }                                     \
+    }
 
 #define MAX_THREADS thread::hardware_concurrency()
 
@@ -201,81 +214,6 @@ public:
     }
 };
 
-template <typename T>
-class ThreadSafeQueue
-{
-private:
-    const unsigned int SIZE;     // the actual size of the queue pointer (capacity +1 because it is circular)
-    const unsigned int CAPACITY; // usable space of the queue
-
-    T *queue;
-
-    unsigned int head;
-    unsigned int tail;
-
-    mutex locker;
-    condition_variable cv;
-
-    int getSpace() const
-    {
-        if (this->tail < this->head)
-        {
-            return this->head - this->tail - 1; // no need to account for 0 index because index of tail itself is empty
-        }
-        else
-        {
-            return this->head + ((this->SIZE - 1) - this->tail); // count the space between 0th index and head, and the space between tail and the final index
-        }
-    }
-
-public:
-    ThreadSafeQueue(unsigned int capacity) : out(output), SIZE(capacity + 1), CAPACITY(capacity)
-    {
-        this->queue = new T[this->SIZE];
-        this->head = 0;
-        this->tail = 0;
-    }
-
-    ~ThreadSafeQueue()
-    {
-        delete[] queue;
-    }
-
-    void push(const T &data)
-    {
-        unique_lock<mutex> lock(this->locker); // automatically locks and unlocks in and out of scope
-
-        while (this->getSpace() == 0)
-        {
-            // queue is full
-            this->cv.wait(lock);
-            // will recheck the condition once woken up (because it is in while)
-        }
-
-        this->queue[this->tail] = data;
-        this->tail = (this->tail + 1) % this->SIZE; // wraps back to 0 if tail reaches to max of size
-        this->cv.notify_one();                      // we just added value, so it can pop
-    }
-
-    T pop()
-    {
-        unique_lock<mutex> lock(this->locker);
-
-        while (this->getSpace() == this->CAPACITY)
-        {
-            // queue is empty
-            this->cv.wait(lock);
-            // will recheck the condition once woken up (because it is in while)
-        }
-
-        T value = queue[this->head];
-
-        this->head = (this->head + 1) % this->SIZE; // also wraps back to 0 if reaches end
-        this->cv.notify_one();                      // we just moved head, so there should be a free space
-        return value;
-    }
-};
-
 class ThreadTask
 {
 private:
@@ -341,26 +279,146 @@ public:
     }
 };
 
-int main(int argc, char *argv[])
+// Example HIP kernel - similar to OpenCL kernel
+__global__ void processFrameKernel(uint8_t *input_data, uint8_t *output_data,
+                                   int width, int height, int channels)
 {
-    VideoFFmpeg video("input.mp4");
-    video.startDecode();
+    // Get thread indices (like OpenCL get_global_id)
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
 
-    ThreadTask tasks(MAX_THREADS - 1);
-
-    int count = 0;
-    while (true)
+    if (x < width && y < height)
     {
-        AVFrame *frame = video.getFrame();
-        if (frame != nullptr)
+        int idx = (y * width + x) * channels;
+
+        // Example: Simple brightness adjustment
+        for (int c = 0; c < channels; c++)
         {
-            count++;
-            cout << "Frame " << frame->pts << endl;
-            av_frame_free(&frame);
-        }
-        else
-        {
-            exit(0);
+            int pixel_idx = idx + c;
+            output_data[pixel_idx] = min(255, (int)(input_data[pixel_idx] * 1.2f));
         }
     }
+}
+
+class HIPConsumer
+{
+private:
+    hipStream_t stream;
+    uint8_t *d_input_buffer;
+    uint8_t *d_output_buffer;
+    size_t buffer_size;
+    int frame_width, frame_height, frame_channels;
+
+public:
+    HIPConsumer(int width, int height, int channels = 3)
+        : frame_width(width), frame_height(height), frame_channels(channels)
+    {
+        // Create non-blocking stream (like OpenCL command queue)
+        HIP_CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
+
+        // Allocate device memory (like clCreateBuffer)
+        buffer_size = width * height * channels * sizeof(uint8_t);
+        HIP_CHECK(hipMalloc(&d_input_buffer, buffer_size));
+        HIP_CHECK(hipMalloc(&d_output_buffer, buffer_size));
+    }
+
+    ~HIPConsumer()
+    {
+        HIP_CHECK(hipFree(d_input_buffer));
+        HIP_CHECK(hipFree(d_output_buffer));
+        HIP_CHECK(hipStreamDestroy(stream));
+    }
+
+    void processFrame(AVFrame *frame)
+    {
+        if (!frame)
+            return;
+
+        // Copy frame data to device (like clEnqueueWriteBuffer)
+        HIP_CHECK(hipMemcpyAsync(d_input_buffer, frame->data[0], buffer_size,
+                                 hipMemcpyHostToDevice, stream));
+
+        // Set up kernel launch parameters (like OpenCL work groups)
+        dim3 blockSize(16, 16); // 16x16 threads per block
+        dim3 gridSize((frame_width + blockSize.x - 1) / blockSize.x,
+                      (frame_height + blockSize.y - 1) / blockSize.y);
+
+        // Launch kernel (like clEnqueueNDRangeKernel)
+        hipLaunchKernelGGL(processFrameKernel, gridSize, blockSize, 0, stream,
+                           d_input_buffer, d_output_buffer,
+                           frame_width, frame_height, frame_channels);
+
+        // Optional: Copy result back to host (like clEnqueueReadBuffer)
+        // HIP_CHECK(hipMemcpyAsync(host_output, d_output_buffer, buffer_size,
+        //                         hipMemcpyDeviceToHost, stream));
+
+        // Optional: Synchronize stream if needed
+        // HIP_CHECK(hipStreamSynchronize(stream));
+    }
+
+    hipStream_t getStream() const { return stream; }
+};
+
+void consumer(VideoFFmpeg *video, int consumer_id)
+{
+    // Create HIP consumer for this thread
+    HIPConsumer hip_consumer(1920, 1080, 3); // Adjust dimensions as needed
+
+    cout << "Consumer " << consumer_id << " started with HIP stream" << endl;
+
+    while (true)
+    {
+        AVFrame *frame = video->getFrame();
+        if (frame == nullptr)
+        {
+            cout << "Consumer " << consumer_id << " finished - no more frames" << endl;
+            break;
+        }
+
+        // Process frame with HIP kernel
+        hip_consumer.processFrame(frame);
+
+        cout << "Consumer " << consumer_id << " processed frame " << frame->pts << endl;
+        av_frame_free(&frame);
+    }
+}
+
+int main(int argc, char *argv[])
+{
+    // Initialize HIP device (like OpenCL context creation)
+    HIP_CHECK(hipSetDevice(0));
+
+    // Get device properties (optional, for debugging)
+    hipDeviceProp_t prop;
+    HIP_CHECK(hipGetDeviceProperties(&prop, 0));
+    cout << "Using device: " << prop.name << endl;
+    cout << "Compute capability: " << prop.major << "." << prop.minor << endl;
+
+    VideoFFmpeg video("input.mp4");
+
+    // Start video decoding in a separate thread
+    std::thread decode_thread([&video]()
+                              { video.startDecode(); });
+
+    // Create consumer threads with HIP processing
+    const int num_consumers = std::min((int)MAX_THREADS - 1, 4); // Leave one thread for decoding
+    ThreadTask tasks(num_consumers);
+
+    // Add consumer tasks
+    for (int i = 0; i < num_consumers; i++)
+    {
+        auto *task = new function<void()>([&video, i]()
+                                          { consumer(&video, i); });
+        tasks.addTask(task, i);
+    }
+
+    // Start all consumer threads
+    tasks.start();
+
+    // Wait for all threads to complete
+    tasks.join();
+    decode_thread.join();
+
+    cout << "All processing completed!" << endl;
+    return 0;
 }
