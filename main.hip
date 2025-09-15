@@ -319,9 +319,77 @@ public:
     }
 };
 
-__global__ void linearRowInterpolate(const unsigned char *plane, unsigned char *output, const int linesize, const int width, const int height)
+// TODO: output does not have the padding value
+// TODO: the size is not exactly width and height times scale, because of the last row/col CHECK PROPERLY
+__global__ void linearRowInterpolate(const unsigned char *plane, unsigned char *output, const int linesize, const int width, const int height, const int scale)
 {
     int global_idx = threadIdx.x + blockIdx.x * blockDim.x;
+
+    int row = global_idx / linesize; // which row we're in
+    int col = global_idx % linesize; // which column in that row
+
+    // check bounds
+    if (row >= height || col >= width)
+        return;
+
+    // Calculate output linesize (scaled width)
+    int output_linesize = width * scale;
+
+    // Starting position in output buffer
+    int output_row_start = row * output_linesize;
+    int output_col_start = col * scale;
+    int output_index = output_row_start + output_col_start;
+
+    unsigned char start = plane[global_idx];
+
+    // Set the original pixel in output
+    output[output_index] = start;
+
+    // if its the last pixel from width, it doesnt have a next pixel to interpolate from
+    // but we still need to place it in the output, which we already did above
+    if (col == width - 1)
+        return;
+
+    unsigned char end = plane[global_idx + 1];
+
+    // gradient = change per step = (end - start) / scale
+    float gradient = (float)(end - start) / (float)scale;
+
+    for (int i = 1; i < scale; i++)
+    {
+        unsigned char interpolated = start + (unsigned char)(i * gradient);
+        output[output_index + i] = interpolated;
+    }
+}
+
+// TODO: make sure to give NO THREADS for the final row
+// TODO: so we are passing one thread for all valued element in the rowInterpolated frame EXCEPT the final row
+// TODO: also PASS THE SAME ROW INTERPOLATED FRAME, it will be modified on top
+__global__ void linearColumnInterpolate(unsigned char *rowInterpolated, const int scaled_width, const int scaled_height, const int scale)
+{
+    int global_idx = threadIdx.x + blockIdx.x * blockDim.x;
+
+    int row = (global_idx / scaled_width) * scale; // which row we're in
+    int col = global_idx % scaled_width;           // which column in that row
+
+    // check bounds
+    if (row >= scaled_height || col >= scaled_width)
+        return;
+
+    // Starting position in output buffer
+    int start_index = (row * scaled_width) + col;
+
+    unsigned char start = rowInterpolated[start_index];
+    unsigned char end = rowInterpolated[start_index + (scale * scaled_width)];
+
+    // gradient = change per step = (end - start) / scale
+    float gradient = (float)(end - start) / (float)scale;
+
+    for (int i = 1; i < scale; i++)
+    {
+        unsigned char interpolated = start + (unsigned char)(i * gradient);
+        rowInterpolated[start_index + (i * scaled_width)] = interpolated;
+    }
 }
 
 void producer(VideoFFmpeg &video)
@@ -329,14 +397,77 @@ void producer(VideoFFmpeg &video)
     video.startDecode();
 }
 
-void consumer(VideoFFmpeg &video)
+void consumer(VideoFFmpeg &video, int upscaleMulti)
 {
     AVFrame *frame = video.getFrame(AV_PIX_FMT_YUV420P);
+    int width = frame->width;
+    int height = frame->height;
+
+    // divide 2 and ceil
+    int chromaWidth = (width + 1) / 2;
+    int chromaHeight = (height + 1) / 2;
 
     hipStream_t stream;
     HIP_CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
 
-    uint8_t *yPlane = frame->data[0]
+    uint8_t *YPlane = frame->data[0];
+    uint8_t *UPlane = frame->data[1];
+    uint8_t *VPlane = frame->data[2];
+
+    // only index that has a "next" row or column can interpolate, so the last col of any row, and last row of any col will be a straight map
+    // a -1 because width and height is overlapping the very last index
+    int newPlaneSize = (((width - 1) * upscaleMulti) * ((height - 1) * upscaleMulti)) + (width + height - 1);
+    // same idea here
+    int newChromaPlaneSize = (((chromaWidth - 1) * upscaleMulti) * ((chromaHeight - 1) * upscaleMulti)) + (chromaWidth + chromaHeight - 1);
+
+    uint8_t *hipYPlane{};
+    uint8_t *hipUPlane{};
+    uint8_t *hipVPlane{};
+
+    uint8_t *scaledYPlane{};
+    uint8_t *scaledUPlane{};
+    uint8_t *scaledVPlane{};
+
+    HIP_CHECK(hipMalloc((void **)&hipYPlane, width * height * sizeof(uint8_t)));
+    HIP_CHECK(hipMalloc((void **)&hipUPlane, chromaWidth * chromaHeight * sizeof(uint8_t)));
+    HIP_CHECK(hipMalloc((void **)&hipVPlane, chromaWidth * chromaHeight * sizeof(uint8_t)));
+
+    HIP_CHECK(hipMalloc((void **)&scaledYPlane, newPlaneSize * sizeof(uint8_t)));
+    HIP_CHECK(hipMalloc((void **)&scaledUPlane, newChromaPlaneSize * sizeof(uint8_t)));
+    HIP_CHECK(hipMalloc((void **)&scaledVPlane, newChromaPlaneSize * sizeof(uint8_t)));
+
+    HIP_CHECK(hipMemcpyAsync(hipYPlane, YPlane, width * height * sizeof(uint8_t), hipMemcpyHostToDevice, stream));
+    HIP_CHECK(hipMemcpyAsync(hipUPlane, UPlane, chromaWidth * chromaHeight * sizeof(uint8_t), hipMemcpyHostToDevice, stream));
+    HIP_CHECK(hipMemcpyAsync(hipVPlane, VPlane, chromaWidth * chromaHeight * sizeof(uint8_t), hipMemcpyHostToDevice, stream));
+
+    int threadsPerBlock = 256;
+
+    // TODO: double check this, pretty sure the threadcount was supposed to be linesize
+    int numBlocks = (width * height + threadsPerBlock - 1) / threadsPerBlock;
+    int linesize = frame->linesize[0];
+    void *args[] = {&hipYPlane, &scaledYPlane, &linesize, &width, &height, &upscaleMulti};
+    HIP_CHECK(hipLaunchKernel((const void *)linearRowInterpolate, dim3(numBlocks), dim3(threadsPerBlock), args, 0, stream));
+
+    HIP_CHECK(hipStreamSynchronize(stream));
+
+    int newWidth = ((width - 1) * upscaleMulti) + 1;
+    int newHeight = ((height - 1) * upscaleMulti) + 1;
+    int newNumBlocks = (newWidth * height + threadsPerBlock - 1) / threadsPerBlock;
+    void *args2[] = {&scaledYPlane, &newWidth, &newHeight, &upscaleMulti};
+    HIP_CHECK(hipLaunchKernel((const void *)linearColumnInterpolate, dim3(newNumBlocks), dim3(threadsPerBlock), args2, 0, stream));
+
+    uint8_t *hostScaledYPlane = new uint8_t[newPlaneSize];
+    HIP_CHECK(hipMemcpy(hostScaledYPlane, scaledYPlane, newPlaneSize * sizeof(uint8_t), hipMemcpyDeviceToHost));
+
+    HIP_CHECK(hipFree(hipYPlane));
+    HIP_CHECK(hipFree(hipUPlane));
+    HIP_CHECK(hipFree(hipVPlane));
+    HIP_CHECK(hipFree(scaledYPlane));
+    HIP_CHECK(hipFree(scaledUPlane));
+    HIP_CHECK(hipFree(scaledVPlane));
+    HIP_CHECK(hipStreamDestroy(stream));
+
+    delete[] hostScaledYPlane;
 }
 
 int main(int argc, char *argv[])
@@ -348,23 +479,25 @@ int main(int argc, char *argv[])
 
     // ThreadTask tasks(MAX_THREADS - 1);
 
-    int count = 0;
-    while (true)
-    {
-        AVFrame *frame = video.getFrame();
-        if (frame != nullptr)
-        {
-            count++;
-            AVPixelFormat pix_fmt = (AVPixelFormat)frame->format;
-            const char *pix_fmt_name = av_get_pix_fmt_name(pix_fmt);
-            cout << "Frame " << frame->pts << " type " << (pix_fmt_name ? pix_fmt_name : "unknown") << " " << frame->linesize[0] << endl;
-            av_frame_free(&frame);
-            auto test = frame->data[0];
-            // auto test = frame->linesize[0];
-        }
-        else
-        {
-            exit(0);
-        }
-    }
+    consumer(video, 2);
+
+    // int count = 0;
+    // while (true)
+    // {
+    //     AVFrame *frame = video.getFrame(AV_PIX_FMT_YUV420P);
+    //     if (frame != nullptr)
+    //     {
+    //         count++;
+    //         AVPixelFormat pix_fmt = (AVPixelFormat)frame->format;
+    //         const char *pix_fmt_name = av_get_pix_fmt_name(pix_fmt);
+    //         cout << "Frame " << frame->pts << " type " << (pix_fmt_name ? pix_fmt_name : "unknown") << " " << frame->linesize[0] << endl;
+    //         av_frame_free(&frame);
+    //         auto test = frame->data[0];
+    //         // auto test = frame->linesize[0];
+    //     }
+    //     else
+    //     {
+    //         exit(0);
+    //     }
+    // }
 }
