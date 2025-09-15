@@ -333,12 +333,13 @@ __global__ void linearRowInterpolate(const unsigned char *plane, unsigned char *
         return;
 
     // Calculate output linesize (scaled width)
-    int output_linesize = width * scale;
+    // int output_linesize = width * scale;
 
     // Starting position in output buffer
-    int output_row_start = row * output_linesize;
-    int output_col_start = col * scale;
-    int output_index = output_row_start + output_col_start;
+    int output_width = (width - 1) * scale + 1;
+    int output_row = row * scale;
+    int output_col = col * scale;
+    int output_index = (output_row * output_width) + output_col;
 
     unsigned char start = plane[global_idx];
 
@@ -402,6 +403,7 @@ void consumer(VideoFFmpeg &video, int upscaleMulti)
     AVFrame *frame = video.getFrame(AV_PIX_FMT_YUV420P);
     int width = frame->width;
     int height = frame->height;
+    int linesize = frame->linesize[0];
 
     // divide 2 and ceil
     int chromaWidth = (width + 1) / 2;
@@ -416,9 +418,13 @@ void consumer(VideoFFmpeg &video, int upscaleMulti)
 
     // only index that has a "next" row or column can interpolate, so the last col of any row, and last row of any col will be a straight map
     // a -1 because width and height is overlapping the very last index
-    int newPlaneSize = (((width - 1) * upscaleMulti) * ((height - 1) * upscaleMulti)) + (width + height - 1);
+    int newWidth = ((width - 1) * upscaleMulti) + 1;
+    int newHeight = ((height - 1) * upscaleMulti) + 1;
+    int newPlaneSize = newWidth * newHeight;
     // same idea here
-    int newChromaPlaneSize = (((chromaWidth - 1) * upscaleMulti) * ((chromaHeight - 1) * upscaleMulti)) + (chromaWidth + chromaHeight - 1);
+    int newChromaWidth = ((chromaWidth - 1) * upscaleMulti) + 1;
+    int newChromaHeight = ((chromaHeight - 1) * upscaleMulti) + 1;
+    int newChromaPlaneSize = newChromaWidth * newChromaHeight;
 
     uint8_t *hipYPlane{};
     uint8_t *hipUPlane{};
@@ -443,21 +449,35 @@ void consumer(VideoFFmpeg &video, int upscaleMulti)
     int threadsPerBlock = 256;
 
     // TODO: double check this, pretty sure the threadcount was supposed to be linesize
-    int numBlocks = (width * height + threadsPerBlock - 1) / threadsPerBlock;
-    int linesize = frame->linesize[0];
+    int numBlocks = (linesize * height + threadsPerBlock - 1) / threadsPerBlock;
     void *args[] = {&hipYPlane, &scaledYPlane, &linesize, &width, &height, &upscaleMulti};
     HIP_CHECK(hipLaunchKernel((const void *)linearRowInterpolate, dim3(numBlocks), dim3(threadsPerBlock), args, 0, stream));
 
     HIP_CHECK(hipStreamSynchronize(stream));
 
-    int newWidth = ((width - 1) * upscaleMulti) + 1;
-    int newHeight = ((height - 1) * upscaleMulti) + 1;
     int newNumBlocks = (newWidth * height + threadsPerBlock - 1) / threadsPerBlock;
     void *args2[] = {&scaledYPlane, &newWidth, &newHeight, &upscaleMulti};
     HIP_CHECK(hipLaunchKernel((const void *)linearColumnInterpolate, dim3(newNumBlocks), dim3(threadsPerBlock), args2, 0, stream));
 
+    HIP_CHECK(hipStreamSynchronize(stream));
+
     uint8_t *hostScaledYPlane = new uint8_t[newPlaneSize];
     HIP_CHECK(hipMemcpy(hostScaledYPlane, scaledYPlane, newPlaneSize * sizeof(uint8_t), hipMemcpyDeviceToHost));
+
+    // DEBUG
+    // {
+    //     // Final dimensions
+    //     int finalWidth = ((width - 1) * upscaleMulti) + 1;
+    //     int finalHeight = ((height - 1) * upscaleMulti) + 1;
+
+    //     // Create PGM image
+    //     FILE *pgmFile = fopen("output.pgm", "wb");
+    //     fprintf(pgmFile, "P5\n%d %d\n255\n", finalWidth, finalHeight);
+    //     fwrite(hostScaledYPlane, sizeof(uint8_t), finalWidth * finalHeight, pgmFile);
+    //     fclose(pgmFile);
+
+    //     cout << "Created " << finalWidth << "x" << finalHeight << " image" << endl;
+    // }
 
     HIP_CHECK(hipFree(hipYPlane));
     HIP_CHECK(hipFree(hipUPlane));
@@ -479,7 +499,7 @@ int main(int argc, char *argv[])
 
     // ThreadTask tasks(MAX_THREADS - 1);
 
-    consumer(video, 2);
+    consumer(video, 5);
 
     // int count = 0;
     // while (true)
