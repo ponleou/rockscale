@@ -276,43 +276,68 @@ public:
     }
 };
 
-class ThreadPool
+class ThreadTask
 {
 private:
-    vector<pthread_t *> threadPool;
+    vector<pthread_t> threads;
+    vector<function<void()> *> tasks;
+    bool started;
 
-    queue<function<void()> *> taskPool;
-    mutex taskPoolLocker;
-
-    function<void()> *getTask()
+    static void *functionCaller(void *arg)
     {
-        unique_lock<mutex> taskPoolLock(this->taskPoolLocker);
-        if (this->taskPool.empty())
-            return nullptr;
-
-        function<void()> *task = this->taskPool.front();
-        this->taskPool.pop();
-        return task;
-    }
-
-    void *threadWorker(void *args)
-    {
-        while (true)
-        {
-        }
+        function<void()> *func = static_cast<function<void()> *>(arg);
+        if (func)
+            (*func)();
+        return nullptr;
     }
 
 public:
-    ThreadPool(int threads)
+    const int size;
+
+    ThreadTask(int threadCount) : size(threadCount)
     {
-        for (int i = 0; i < threads; i++)
-            this->threadPool.push_back(new pthread_t());
+        this->threads = vector<pthread_t>(this->size);
+        this->tasks = vector<function<void()> *>(this->size, nullptr);
+        this->started = false;
     }
 
-    ~ThreadPool()
+    ~ThreadTask()
     {
-        for (int i = 0; i < this->threadPool.size(); i++)
-            delete this->threadPool[i];
+        for (int i = 0; i < this->tasks.size(); i++)
+            delete this->tasks[i];
+    }
+
+    void addTask(function<void()> *task, int assignedThread)
+    {
+        this->tasks[assignedThread] = task;
+    }
+
+    void start()
+    {
+        if (started)
+            throw std::logic_error("Instance is already executed.");
+
+        this->started = true;
+        for (int i = 0; i < this->tasks.size(); i++)
+        {
+            if (this->tasks[i] == nullptr)
+                continue;
+            pthread_create(&this->threads[i], nullptr, ThreadTask::functionCaller, this->tasks[i]);
+        }
+    }
+
+    void join()
+    {
+        if (!started)
+            return;
+
+        for (int i = 0; i < this->tasks.size(); i++)
+        {
+            if (this->tasks[i] == nullptr)
+                continue;
+
+            pthread_join(this->threads[i], nullptr);
+        }
     }
 };
 
@@ -320,6 +345,8 @@ int main(int argc, char *argv[])
 {
     VideoFFmpeg video("input.mp4");
     video.startDecode();
+
+    ThreadTask tasks(MAX_THREADS - 1);
 
     int count = 0;
     while (true)
