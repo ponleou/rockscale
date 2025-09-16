@@ -165,7 +165,6 @@ public:
                 if (this->encoder == nullptr)
                     this->raiseError("Failed to find encoder", codecCode);
 
-                // Use the original stream's timebase to preserve exact timing
                 this->encoder->time_base = this->inFile->streams[i]->time_base;
 
                 this->encoderInitialised = false; // need an initialise function
@@ -319,37 +318,6 @@ public:
         this->decoderCV.notify_all();
 
         return frame;
-
-        // TODO: remove commented code
-        // frame = av_frame_alloc();
-
-        // int recvCode;
-        // unique_lock<mutex> codecLock(this->codecLocker);
-        // while ((recvCode = avcodec_receive_frame(this->decoder, frame)) != 0)
-        // {
-        //     if (recvCode == AVERROR(EAGAIN))
-        //     {
-        //         cout << "this should never happen" << endl;
-        //         this->codecCV.wait(codecLock);
-
-        //         // try getting from queue again
-        //         AVFrame *frameBuffer = getFrameFromBuffer();
-        //         if (frameBuffer != nullptr)
-        //             return frameBuffer;
-        //     }
-
-        //     // end of file, return nullptr
-        //     else if (recvCode == AVERROR_EOF)
-        //         return nullptr;
-
-        //     // errors
-        //     else if (recvCode == AVERROR(EINVAL))
-        //         exit(1);
-        //     else if (recvCode < 0)
-        //         exit(1);
-        // }
-        // // cout << "Read frame from codec" << endl;
-        // return frame;
     }
 
     AVFrame *getFrame(AVPixelFormat format)
@@ -404,11 +372,11 @@ public:
         this->encoder->height = height;
         this->encoder->pix_fmt = format;
 
-        // Add proper color space settings for H.264
-        this->encoder->color_range = AVCOL_RANGE_MPEG;
-        this->encoder->colorspace = AVCOL_SPC_BT709;
-        this->encoder->color_primaries = AVCOL_PRI_BT709;
-        this->encoder->color_trc = AVCOL_TRC_BT709;
+        // FIXME: remove
+        // this->encoder->color_range = AVCOL_RANGE_MPEG;
+        // this->encoder->colorspace = AVCOL_SPC_BT709;
+        // this->encoder->color_primaries = AVCOL_PRI_BT709;
+        // this->encoder->color_trc = AVCOL_TRC_BT709;
 
         int decoderSize = this->decoder->width * this->decoder->height;
         int newSize = width * height;
@@ -434,8 +402,8 @@ public:
             this->raiseError("Frame doesn't match encoder");
 
         // change frame width and height to even for compatibility
-        frame->width &= ~1;
-        frame->height &= ~1;
+        // frame->width &= ~1;
+        // frame->height &= ~1;
 
         unique_lock<mutex> lock(this->ebufferLocker);
 
@@ -445,20 +413,6 @@ public:
         }
         this->encodeBuffer.push(frame);
         this->encoderCV.notify_all();
-
-        // TODO: remove
-        // int orderedIndex = -1;
-        // for (int i = 0; i < this->encodeBuffer.size(); i++)
-        //     if (this->encodeBuffer[i]->pts > frame->pts)
-        //     {
-        //         orderedIndex = i;
-        //         break;
-        //     }
-
-        // if (orderedIndex != -1)
-        //     this->encodeBuffer.insert(this->encodeBuffer.begin() + orderedIndex, frame);
-        // else
-        //     this->encodeBuffer.push_back(frame);
     }
 
     void notifyEndEncode()
@@ -476,8 +430,8 @@ public:
                 this->raiseError("Encoder not initialised");
         }
 
-        this->encoder->thread_count = 0; // Disable encoder threading to avoid opaque pointer issues
-        // this->encoder->thread_type = FF_THREAD_SLICE;
+        this->encoder->thread_count = threads;
+        this->encoder->thread_type = FF_THREAD_FRAME;
 
         int codecCode;
         if ((codecCode = avcodec_open2(this->encoder, this->encoderCodec, nullptr)) < 0)
@@ -491,6 +445,7 @@ public:
             {
                 unique_lock<mutex> lock(this->ebufferLocker);
 
+                // Wait until we have frames
                 while (this->encodeBuffer.empty())
                 {
                     if (this->encodeEnded)
@@ -498,16 +453,26 @@ public:
                     this->encoderCV.wait(lock);
                 }
 
-                // check and break again
-                if (this->encodeEnded)
+                // If we're ending and buffer is empty, break
+                if (this->encodeEnded && this->encodeBuffer.empty())
                     break;
 
+                // only encode if the buffer has a threshold amount of frames
+                // NOTE: we are relying on the fact that if enough frames accumulate, the order will be near guarenteed
+                // ALSO NOTE: the buffer size of the encode and decode buffer is the same, so if we wait until buffer is full, then it is 100% guarenteed to be correct positions
+                int threshold = (this->BATCH_SIZE * 3) / 4;
+                while (this->encodeBuffer.size() < threshold && !this->encodeEnded)
+                {
+                    this->encoderCV.wait(lock);
+                }
+
+                // Take just one frame (the one with smallest PTS)
                 frame = this->encodeBuffer.top();
                 this->encodeBuffer.pop();
                 this->ebufferCV.notify_all(); // Wake up processors waiting for buffer space
             }
-            cout << "frame picked" << endl;
 
+            // Encode this single frame
             int codecCode = avcodec_send_frame(this->encoder, frame);
             if (codecCode < 0)
                 this->raiseError("Error sending frame to encoder", codecCode);
@@ -524,15 +489,41 @@ public:
                 this->raiseError("Error receiving packet from encoder", codecCode);
 
             av_frame_free(&frame);
-
-            cout << "frame encoded" << endl;
         }
-        cout << "encoder got end signal" << endl;
+
+        // Process any remaining frames when ending
+        {
+            unique_lock<mutex> lock(this->ebufferLocker);
+            while (!this->encodeBuffer.empty())
+            {
+                AVFrame *frame = this->encodeBuffer.top();
+                this->encodeBuffer.pop();
+                lock.unlock();
+                // unlock for encode
+
+                int codecCode = avcodec_send_frame(this->encoder, frame);
+                if (codecCode < 0)
+                    this->raiseError("Error sending remaining frame to encoder", codecCode);
+
+                AVPacket *pkt = av_packet_alloc();
+                while ((codecCode = avcodec_receive_packet(this->encoder, pkt)) == 0)
+                {
+                    pkt->stream_index = outStream->index;
+                    av_interleaved_write_frame(this->outFile, pkt);
+                    av_packet_unref(pkt);
+                }
+
+                if (codecCode != AVERROR(EAGAIN) && codecCode != AVERROR_EOF)
+                    this->raiseError("Error receiving packet from remaining frame", codecCode);
+
+                av_frame_free(&frame);
+
+                lock.lock(); // lock for checking while loop condition
+            }
+        }
 
         // sending EOF to encoder
         avcodec_send_frame(this->encoder, nullptr);
-
-        cout << "did we get here?" << endl;
 
         // just making sure all packets are recieved
         AVPacket *pkt = av_packet_alloc();
@@ -545,21 +536,17 @@ public:
             cout << "flushing" << endl;
         }
 
-        cout << "how about here?" << endl;
-
         // Check if we exited due to EOF (expected) or an error
         if (ret != AVERROR_EOF)
         {
-            cout << "Flush error: " << ret << endl;
-            av_packet_free(&pkt);
-            this->raiseError("Error during encoder flush", ret);
+            cout << "Encoder flush error: " << ret << endl;
         }
 
+        cout << "finished flushing" << endl;
         av_packet_free(&pkt);
 
-        cout << "encoder finished all frames" << endl;
-
         // finish file
+        cout << "start ing write file" << endl;
         av_write_trailer(this->outFile);
         if (!(this->outFile->oformat->flags & AVFMT_NOFILE))
             avio_closep(&this->outFile->pb);
@@ -789,7 +776,6 @@ void bilinearInterpolation(AVFrame **frame, int scale, hipStream_t &stream, uint
     av_frame_free(frame);
     *frame = newFrame;
 
-    cout << "finished frame" << endl;
     // DEBUG
     // {
     //     // Final dimensions
@@ -880,17 +866,12 @@ void processor(VideoFFmpeg &video, int scale)
 
     while (true)
     {
-        cout << "getting frame" << endl;
         frame = video.getFrame(AV_PIX_FMT_YUV420P);
-        cout << "got frame" << endl;
         if (frame == nullptr)
         {
-            cout << "breaking" << endl;
             break;
         }
-        cout << "processing frame" << endl;
         bilinearInterpolation(&frame, scale, stream, hipYPlane, hipUPlane, hipVPlane, scaledYPlane, scaledUPlane, scaledVPlane);
-        cout << "finished processing frame" << endl;
 
         video.addEncodeFrames(frame);
     }
@@ -922,24 +903,13 @@ int main(int argc, char *argv[])
     int scaledWidth = (dimension.first - 1) * scale + 1;
     int scaledHeight = (dimension.second - 1) * scale + 1;
     video.initialiseEncoder(scaledWidth, scaledHeight, AV_PIX_FMT_YUV420P);
-    // video.startDecode();
-    // TODO: call producer
-
-    // ThreadTask tasks(MAX_THREADS - 1);
 
     ThreadTask threads(threadCount - 1);
 
-    // cout << "Starting decode..." << endl;
-    // video.startDecode();
-    // cout << "Decode complete, starting upscale threads..." << endl;
-
-    // producer becomes processor once its finished with its task
     auto producerTask = [&video, scale]()
     {
         producer(video, scale);
         cout << "producer finished" << endl;
-
-        // processor(video, scale);
     };
 
     auto processorTask = [&video, scale]()
@@ -992,24 +962,4 @@ int main(int argc, char *argv[])
     cout << "All threads completed successfully" << endl;
 
     return 0;
-
-    // int count = 0;
-    // while (true)
-    // {
-    //     AVFrame *frame = video.getFrame(AV_PIX_FMT_YUV420P);
-    //     if (frame != nullptr)
-    //     {
-    //         count++;
-    //         AVPixelFormat pix_fmt = (AVPixelFormat)frame->format;
-    //         const char *pix_fmt_name = av_get_pix_fmt_name(pix_fmt);
-    //         cout << "Frame " << frame->pts << " type " << (pix_fmt_name ? pix_fmt_name : "unknown") << " " << frame->linesize[0] << endl;
-    //         av_frame_free(&frame);
-    //         auto test = frame->data[0];
-    //         // auto test = frame->linesize[0];
-    //     }
-    //     else
-    //     {
-    //         exit(0);
-    //     }
-    // }
 }
