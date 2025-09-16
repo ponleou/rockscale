@@ -36,6 +36,7 @@ using std::endl;
 using std::max;
 using std::mutex;
 using std::pair;
+using std::priority_queue;
 using std::queue;
 using std::string;
 using std::unique_lock;
@@ -59,37 +60,42 @@ using std::vector;
 class VideoFFmpeg
 {
 private:
+    struct ComparePTS
+    {
+        bool operator()(const AVFrame *a, const AVFrame *b) const
+        {
+            return a->pts > b->pts; // smaller pts first
+        }
+    };
+
+    const int BATCH_SIZE;
     AVFormatContext *inFile;
-    AVCodecContext *decoder;
     int videoIndex;
-
-    mutex codecLocker;
-    condition_variable codecCV;
-
-    queue<AVFrame *> decodedBuffer;
-    mutex decodedBufferLocker;
-
-    const AVCodec *encoderCodec;
-    AVCodecContext *encoder;
-    bool encoderInitialised;
-
-    vector<AVFrame *> encodeBuffer;
-    mutex encodeBufferLocker;
 
     AVFormatContext *outFile;
     AVStream *outStream;
 
-    AVFrame *getFrameFromBuffer()
-    {
-        unique_lock<mutex> bufferLock(this->decodedBufferLocker);
-        if (!this->decodedBuffer.empty())
-        {
-            AVFrame *frame = this->decodedBuffer.front();
-            this->decodedBuffer.pop();
-            return frame;
-        }
-        return nullptr;
-    }
+    // FIXME: probably dont need this
+    mutex codecLocker;
+    condition_variable codecCV;
+
+    AVCodecContext *decoder;
+    condition_variable decoderCV; // NOTE: not for the buffer, its used by the decoder itself
+
+    bool decoderFinished;
+    queue<AVFrame *> decodeBuffer;
+    mutex dbufferLocker; // NOTE: must mutex decoderFinished and decodeBuffer
+    condition_variable dbufferCV;
+
+    const AVCodec *encoderCodec;
+    AVCodecContext *encoder;
+    condition_variable encoderCV;
+
+    bool encoderInitialised;
+    bool encodeEnded;
+    priority_queue<AVFrame *, vector<AVFrame *>, ComparePTS> encodeBuffer;
+    mutex ebufferLocker; // NOTE: must mutex encoderInitialised and encodeBuffer
+    condition_variable ebufferCV;
 
     void raiseError(string message, int code = -1)
     {
@@ -122,7 +128,7 @@ private:
     }
 
 public:
-    VideoFFmpeg(string fileName, int decodeThreads = 0)
+    VideoFFmpeg(string fileName, int batchSize, int decodeThreads = 0) : BATCH_SIZE(batchSize)
     {
         int fileCode;
 
@@ -163,6 +169,8 @@ public:
                 this->encoder->time_base = this->inFile->streams[i]->time_base;
 
                 this->encoderInitialised = false; // need an initialise function
+                this->encodeEnded = false;
+                this->decoderFinished = false;
 
                 this->videoIndex = i;
                 break;
@@ -176,10 +184,12 @@ public:
         avcodec_free_context(&this->decoder);
         avcodec_free_context(&this->encoder);
 
-        for (int i = 0; i < this->encodeBuffer.size(); i++)
-            av_frame_free(&encodeBuffer[i]);
-
-        this->encodeBuffer.clear();
+        while (!this->encodeBuffer.empty())
+        {
+            AVFrame *frame = this->encodeBuffer.top();
+            av_frame_free(&frame);
+            this->encodeBuffer.pop();
+        }
     }
 
     pair<int, int> getDimension()
@@ -191,6 +201,7 @@ public:
     {
         int sendCode;
         AVPacket *packet = av_packet_alloc();
+
         while (av_read_frame(this->inFile, packet) >= 0)
         {
             if (packet->stream_index == this->videoIndex)
@@ -198,35 +209,53 @@ public:
                 unique_lock<mutex> codecLock(this->codecLocker);
 
                 // codec buffer is full, need to get decoded frames out
-                // TODO: find out how to eof codec
-                while ((sendCode = avcodec_send_packet(this->decoder, packet)) == AVERROR(EAGAIN))
+                if ((sendCode = avcodec_send_packet(this->decoder, packet)) != 0)
+                {
+                    if (sendCode != AVERROR(EAGAIN))
+                        this->raiseError("Failed to decode frame", sendCode);
+                }
+
+                while (true)
                 {
                     AVFrame *frame = av_frame_alloc();
                     int recvCode = avcodec_receive_frame(this->decoder, frame);
+
                     // if we got one, then we put that to the buffer
                     if (recvCode == 0)
                     {
-                        unique_lock<mutex> bufferLock(this->decodedBufferLocker);
-                        this->decodedBuffer.push(frame);
-                        // cout << "Frame placed in buffer" << endl;
+                        unique_lock<mutex> bufferLock(this->dbufferLocker);
+
+                        // sleep if its full
+                        while (this->decodeBuffer.size() > this->BATCH_SIZE)
+                            this->decoderCV.wait(bufferLock);
+
+                        this->decodeBuffer.push(frame);
+
+                        // TODO: notify one?
+                        // new frame incoming, wake all waiting for frame
+                        this->dbufferCV.notify_all();
                     }
 
-                    // the only scenario where both avcodec_receive_frame and avcodec_send_packet is both AVERROR(EAGAIN) is when buffer is full, but frames are still decoding
-                    // so we give up lock, sleep for a bit, then try to send again
+                    // no frames available currently, break
                     else if (recvCode == AVERROR(EAGAIN))
                     {
                         av_frame_free(&frame);
-                        this->codecCV.wait_for(codecLock, milliseconds(10));
-                        continue;
+                        break;
                     }
 
                     // impossible scenario tho?
                     else if (recvCode == AVERROR_EOF)
+                    {
+                        av_frame_free(&frame);
                         break;
+                    }
 
                     // error
                     else if (recvCode == AVERROR(EINVAL) || recvCode < 0)
+                    {
+                        av_frame_free(&frame);
                         this->raiseError("Failed to get frame from codec", recvCode);
+                    }
                 }
 
                 // FIXME: might fail when recvcode was EOF
@@ -240,48 +269,87 @@ public:
         }
         av_packet_free(&packet);
 
+        // flush remaining frames from decoder
+        while (true)
+        {
+            AVFrame *frame = av_frame_alloc();
+            int recvCode = avcodec_receive_frame(this->decoder, frame);
+            if (recvCode == 0)
+            {
+                unique_lock<mutex> bufferLock(this->dbufferLocker);
+
+                while (this->decodeBuffer.size() > this->BATCH_SIZE)
+                    this->decoderCV.wait(bufferLock);
+
+                this->decodeBuffer.push(frame);
+                this->dbufferCV.notify_all();
+            }
+            else
+            {
+                av_frame_free(&frame);
+                break;
+            }
+        }
+
+        // EOF the decoder
         if ((sendCode = avcodec_send_packet(this->decoder, nullptr)) != 0)
             this->raiseError("Failed to EOF", sendCode);
-    }
 
+        // lock when changing bool, and wake up for threads to check new bool
+        unique_lock<mutex> lock(this->dbufferLocker);
+        this->decoderFinished = true;
+        this->dbufferCV.notify_all();
+    }
     // this function promises to always return a frame, unless theres none left, which it will return nullptr
     AVFrame *getFrame()
     {
-        AVFrame *frame = getFrameFromBuffer();
-        if (frame != nullptr)
+        AVFrame *frame = nullptr;
+
+        unique_lock<mutex> bufferLock(this->dbufferLocker);
+        while (this->decodeBuffer.empty())
         {
-            // cout << "Read frame from buffer" << endl;
-            return frame;
-        }
-
-        frame = av_frame_alloc();
-
-        int recvCode;
-        unique_lock<mutex> codecLock(this->codecLocker);
-        while ((recvCode = avcodec_receive_frame(this->decoder, frame)) != 0)
-        {
-            if (recvCode == AVERROR(EAGAIN))
-            {
-                this->codecCV.wait(codecLock);
-
-                // try getting from queue again
-                AVFrame *frameBuffer = getFrameFromBuffer();
-                if (frameBuffer != nullptr)
-                    return frameBuffer;
-            }
-
-            // end of file, return nullptr
-            else if (recvCode == AVERROR_EOF)
+            if (this->decoderFinished)
                 return nullptr;
 
-            // errors
-            else if (recvCode == AVERROR(EINVAL))
-                exit(1);
-            else if (recvCode < 0)
-                exit(1);
+            this->dbufferCV.wait(bufferLock);
         }
-        // cout << "Read frame from codec" << endl;
+        frame = this->decodeBuffer.front();
+        this->decodeBuffer.pop();
+
+        this->decoderCV.notify_all();
+
         return frame;
+
+        // TODO: remove commented code
+        // frame = av_frame_alloc();
+
+        // int recvCode;
+        // unique_lock<mutex> codecLock(this->codecLocker);
+        // while ((recvCode = avcodec_receive_frame(this->decoder, frame)) != 0)
+        // {
+        //     if (recvCode == AVERROR(EAGAIN))
+        //     {
+        //         cout << "this should never happen" << endl;
+        //         this->codecCV.wait(codecLock);
+
+        //         // try getting from queue again
+        //         AVFrame *frameBuffer = getFrameFromBuffer();
+        //         if (frameBuffer != nullptr)
+        //             return frameBuffer;
+        //     }
+
+        //     // end of file, return nullptr
+        //     else if (recvCode == AVERROR_EOF)
+        //         return nullptr;
+
+        //     // errors
+        //     else if (recvCode == AVERROR(EINVAL))
+        //         exit(1);
+        //     else if (recvCode < 0)
+        //         exit(1);
+        // }
+        // // cout << "Read frame from codec" << endl;
+        // return frame;
     }
 
     AVFrame *getFrame(AVPixelFormat format)
@@ -306,6 +374,12 @@ public:
             frame->width, frame->height, (AVPixelFormat)frame->format,
             frame->width, frame->height, format,
             SWS_BICUBIC, nullptr, nullptr, nullptr);
+
+        // Set proper color range to avoid deprecated pixel format warnings
+        // int *inv_table, *table, srcRange, dstRange, brightness, contrast, saturation;
+        // sws_getColorspaceDetails(sws_ctx, &inv_table, &srcRange, &table, &dstRange, &brightness, &contrast, &saturation);
+        // sws_setColorspaceDetails(sws_ctx, inv_table, 1, table, 1, brightness, contrast, saturation);
+
         sws_scale(sws_ctx, frame->data, frame->linesize, 0, frame->height, convertedFrame->data, convertedFrame->linesize);
 
         sws_freeContext(sws_ctx);
@@ -316,9 +390,25 @@ public:
 
     void initialiseEncoder(int width, int height, AVPixelFormat format)
     {
+        {
+            unique_lock<mutex> lock(this->ebufferLocker);
+            if (encoderInitialised)
+                this->raiseError("Encoder already initialised");
+        }
+
+        // force even for compatibility for specific encode codecs (h264)
+        width &= ~1;
+        height &= ~1;
+
         this->encoder->width = width;
         this->encoder->height = height;
         this->encoder->pix_fmt = format;
+
+        // Add proper color space settings for H.264
+        this->encoder->color_range = AVCOL_RANGE_MPEG;
+        this->encoder->colorspace = AVCOL_SPC_BT709;
+        this->encoder->color_primaries = AVCOL_PRI_BT709;
+        this->encoder->color_trc = AVCOL_TRC_BT709;
 
         int decoderSize = this->decoder->width * this->decoder->height;
         int newSize = width * height;
@@ -326,45 +416,68 @@ public:
         float scale = (float)newSize / (float)decoderSize;
         this->encoder->bit_rate = this->decoder->bit_rate * scale;
 
-        unique_lock<mutex> lock(this->encodeBufferLocker);
+        unique_lock<mutex> lock(this->ebufferLocker);
         this->encoderInitialised = true;
+        this->ebufferCV.notify_all();
     }
 
     void addEncodeFrames(AVFrame *frame)
     {
         {
-            unique_lock<mutex> lock(this->encodeBufferLocker);
+            unique_lock<mutex> lock(this->ebufferLocker);
             if (!this->encoderInitialised)
                 this->raiseError("Encoder not initialised");
         }
 
-        if (frame->width != this->encoder->width || frame->height != this->encoder->height || frame->format != this->encoder->pix_fmt)
+        // apply even for width and height
+        if ((frame->width & ~1) != this->encoder->width || (frame->height & ~1) != this->encoder->height || frame->format != this->encoder->pix_fmt)
             this->raiseError("Frame doesn't match encoder");
 
-        int orderedIndex = -1;
-        for (int i = 0; i < this->encodeBuffer.size(); i++)
-            if (this->encodeBuffer[i]->pts > frame->pts)
-            {
-                orderedIndex = i;
-                break;
-            }
+        // change frame width and height to even for compatibility
+        frame->width &= ~1;
+        frame->height &= ~1;
 
-        if (orderedIndex != -1)
-            this->encodeBuffer.insert(this->encodeBuffer.begin() + orderedIndex, frame);
-        else
-            this->encodeBuffer.push_back(frame);
+        unique_lock<mutex> lock(this->ebufferLocker);
+
+        while (this->encodeBuffer.size() > BATCH_SIZE)
+        {
+            this->ebufferCV.wait(lock);
+        }
+        this->encodeBuffer.push(frame);
+        this->encoderCV.notify_all();
+
+        // TODO: remove
+        // int orderedIndex = -1;
+        // for (int i = 0; i < this->encodeBuffer.size(); i++)
+        //     if (this->encodeBuffer[i]->pts > frame->pts)
+        //     {
+        //         orderedIndex = i;
+        //         break;
+        //     }
+
+        // if (orderedIndex != -1)
+        //     this->encodeBuffer.insert(this->encodeBuffer.begin() + orderedIndex, frame);
+        // else
+        //     this->encodeBuffer.push_back(frame);
     }
 
-    void startEncode(const char *fileName, int threads)
+    void notifyEndEncode()
+    {
+        unique_lock<mutex> lock(this->ebufferLocker);
+        this->encodeEnded = true;
+        this->ebufferCV.notify_all();
+    }
+
+    void startEncode(const char *fileName, int threads = 0)
     {
         {
-            unique_lock<mutex> lock(this->encodeBufferLocker);
+            unique_lock<mutex> lock(this->ebufferLocker);
             if (!this->encoderInitialised)
                 this->raiseError("Encoder not initialised");
         }
 
-        this->encoder->thread_count = threads;
-        this->encoder->thread_type = FF_THREAD_FRAME;
+        this->encoder->thread_count = 0; // Disable encoder threading to avoid opaque pointer issues
+        // this->encoder->thread_type = FF_THREAD_SLICE;
 
         int codecCode;
         if ((codecCode = avcodec_open2(this->encoder, this->encoderCodec, nullptr)) < 0)
@@ -372,10 +485,29 @@ public:
 
         this->prepareEncode(fileName);
 
-        unique_lock<mutex> lock(this->encodeBufferLocker);
-
-        for (AVFrame *frame : this->encodeBuffer)
+        while (true)
         {
+            AVFrame *frame = nullptr;
+            {
+                unique_lock<mutex> lock(this->ebufferLocker);
+
+                while (this->encodeBuffer.empty())
+                {
+                    if (this->encodeEnded)
+                        break;
+                    this->encoderCV.wait(lock);
+                }
+
+                // check and break again
+                if (this->encodeEnded)
+                    break;
+
+                frame = this->encodeBuffer.top();
+                this->encodeBuffer.pop();
+                this->ebufferCV.notify_all(); // Wake up processors waiting for buffer space
+            }
+            cout << "frame picked" << endl;
+
             int codecCode = avcodec_send_frame(this->encoder, frame);
             if (codecCode < 0)
                 this->raiseError("Error sending frame to encoder", codecCode);
@@ -392,21 +524,40 @@ public:
                 this->raiseError("Error receiving packet from encoder", codecCode);
 
             av_frame_free(&frame);
+
+            cout << "frame encoded" << endl;
         }
-        this->encodeBuffer.clear();
+        cout << "encoder got end signal" << endl;
 
         // sending EOF to encoder
         avcodec_send_frame(this->encoder, nullptr);
 
+        cout << "did we get here?" << endl;
+
         // just making sure all packets are recieved
         AVPacket *pkt = av_packet_alloc();
-        while (avcodec_receive_packet(this->encoder, pkt) == 0)
+        int ret;
+        while ((ret = avcodec_receive_packet(this->encoder, pkt)) == 0)
         {
             pkt->stream_index = outStream->index;
             av_interleaved_write_frame(this->outFile, pkt);
             av_packet_unref(pkt);
+            cout << "flushing" << endl;
         }
+
+        cout << "how about here?" << endl;
+
+        // Check if we exited due to EOF (expected) or an error
+        if (ret != AVERROR_EOF)
+        {
+            cout << "Flush error: " << ret << endl;
+            av_packet_free(&pkt);
+            this->raiseError("Error during encoder flush", ret);
+        }
+
         av_packet_free(&pkt);
+
+        cout << "encoder finished all frames" << endl;
 
         // finish file
         av_write_trailer(this->outFile);
@@ -465,19 +616,21 @@ public:
             pthread_create(&this->threads[i], nullptr, ThreadTask::functionCaller, this->tasks[i]);
         }
     }
+    void join(int assignedThread)
+    {
+        if (!started || this->tasks[assignedThread] == nullptr)
+            return;
 
+        pthread_join(this->threads[assignedThread], nullptr);
+    }
+    // join all
     void join()
     {
         if (!started)
             return;
 
         for (int i = 0; i < this->tasks.size(); i++)
-        {
-            if (this->tasks[i] == nullptr)
-                continue;
-
-            pthread_join(this->threads[i], nullptr);
-        }
+            this->join(i);
     }
 };
 
@@ -555,7 +708,7 @@ __global__ void linearColumnInterpolate(unsigned char *rowInterpolated, const in
     }
 }
 
-void bilinearInterpolation(AVFrame **frame, int scale, hipStream_t &stream)
+void bilinearInterpolation(AVFrame **frame, int scale, hipStream_t &stream, uint8_t *hipYPlane, uint8_t *hipUPlane, uint8_t *hipVPlane, uint8_t *scaledYPlane, uint8_t *scaledUPlane, uint8_t *scaledVPlane)
 {
     int width = (*frame)->width;
     int height = (*frame)->height;
@@ -582,53 +735,37 @@ void bilinearInterpolation(AVFrame **frame, int scale, hipStream_t &stream)
     int newChromaHeight = ((chromaHeight - 1) * scale) + 1;
     int newChromaPlaneSize = newChromaWidth * newChromaHeight;
 
-    uint8_t *hipYPlane{};
-    uint8_t *hipUPlane{};
-    uint8_t *hipVPlane{};
-
-    uint8_t *scaledYPlane{};
-    uint8_t *scaledUPlane{};
-    uint8_t *scaledVPlane{};
-
-    HIP_CHECK(hipMalloc((void **)&hipYPlane, width * height * sizeof(uint8_t)));
-    HIP_CHECK(hipMalloc((void **)&hipUPlane, chromaWidth * chromaHeight * sizeof(uint8_t)));
-    HIP_CHECK(hipMalloc((void **)&hipVPlane, chromaWidth * chromaHeight * sizeof(uint8_t)));
-
-    HIP_CHECK(hipMalloc((void **)&scaledYPlane, newPlaneSize * sizeof(uint8_t)));
-    HIP_CHECK(hipMalloc((void **)&scaledUPlane, newChromaPlaneSize * sizeof(uint8_t)));
-    HIP_CHECK(hipMalloc((void **)&scaledVPlane, newChromaPlaneSize * sizeof(uint8_t)));
-
-    HIP_CHECK(hipMemcpyAsync(hipYPlane, YPlane, width * height * sizeof(uint8_t), hipMemcpyHostToDevice, stream));
-    HIP_CHECK(hipMemcpyAsync(hipUPlane, UPlane, chromaWidth * chromaHeight * sizeof(uint8_t), hipMemcpyHostToDevice, stream));
-    HIP_CHECK(hipMemcpyAsync(hipVPlane, VPlane, chromaWidth * chromaHeight * sizeof(uint8_t), hipMemcpyHostToDevice, stream));
+    HIP_CHECK(hipMemcpy2DAsync(hipYPlane, width * sizeof(uint8_t), YPlane, YLinesize, width * sizeof(uint8_t), height, hipMemcpyHostToDevice, stream));
+    HIP_CHECK(hipMemcpy2DAsync(hipUPlane, chromaWidth * sizeof(uint8_t), UPlane, ULinesize, chromaWidth * sizeof(uint8_t), chromaHeight, hipMemcpyHostToDevice, stream));
+    HIP_CHECK(hipMemcpy2DAsync(hipVPlane, chromaWidth * sizeof(uint8_t), VPlane, VLinesize, chromaWidth * sizeof(uint8_t), chromaHeight, hipMemcpyHostToDevice, stream));
 
     int threadsPerBlock = 256;
 
-    int rowThreadCountY = YLinesize * height;
+    int rowThreadCountY = width * height;
     int rowNumBlocksY = ceil((float)rowThreadCountY / (float)threadsPerBlock);
-    void *rowArgsY[] = {&hipYPlane, &scaledYPlane, &YLinesize, &width, &height, &scale};
+    void *rowArgsY[] = {&hipYPlane, &scaledYPlane, &width, &width, &height, &scale};
 
-    int rowThreadCountU = ULinesize * chromaHeight;
+    int rowThreadCountU = chromaWidth * chromaHeight;
     int rowNumBlocksU = ceil((float)rowThreadCountU / (float)threadsPerBlock);
-    void *rowArgsU[] = {&hipUPlane, &scaledUPlane, &ULinesize, &chromaWidth, &chromaHeight, &scale};
+    void *rowArgsU[] = {&hipUPlane, &scaledUPlane, &chromaWidth, &chromaWidth, &chromaHeight, &scale};
 
-    int rowThreadCountV = VLinesize * chromaHeight;
+    int rowThreadCountV = chromaWidth * chromaHeight;
     int rowNumBlocksV = ceil((float)rowThreadCountV / (float)threadsPerBlock);
-    void *rowArgsV[] = {&hipVPlane, &scaledVPlane, &VLinesize, &chromaWidth, &chromaHeight, &scale};
+    void *rowArgsV[] = {&hipVPlane, &scaledVPlane, &chromaWidth, &chromaWidth, &chromaHeight, &scale};
 
     HIP_CHECK(hipLaunchKernel((const void *)linearRowInterpolate, dim3(rowNumBlocksY), dim3(threadsPerBlock), rowArgsY, 0, stream));
     HIP_CHECK(hipLaunchKernel((const void *)linearRowInterpolate, dim3(rowNumBlocksU), dim3(threadsPerBlock), rowArgsU, 0, stream));
     HIP_CHECK(hipLaunchKernel((const void *)linearRowInterpolate, dim3(rowNumBlocksV), dim3(threadsPerBlock), rowArgsV, 0, stream));
 
-    int colThreadCountY = newWidth * height;
+    int colThreadCountY = newWidth * (height - 1);
     int colNumBlocksY = ceil((float)colThreadCountY / (float)threadsPerBlock);
     void *colArgsY[] = {&scaledYPlane, &newWidth, &newHeight, &scale};
 
-    int colThreadCountU = newChromaWidth * chromaHeight;
+    int colThreadCountU = newChromaWidth * (chromaHeight - 1);
     int colNumBlocksU = ceil((float)colThreadCountU / (float)threadsPerBlock);
     void *colArgsU[] = {&scaledUPlane, &newChromaWidth, &newChromaHeight, &scale};
 
-    int colThreadCountV = newChromaWidth * chromaHeight;
+    int colThreadCountV = newChromaWidth * (chromaHeight - 1);
     int colNumBlocksV = ceil((float)colThreadCountV / (float)threadsPerBlock);
     void *colArgsV[] = {&scaledVPlane, &newChromaWidth, &newChromaHeight, &scale};
 
@@ -646,12 +783,13 @@ void bilinearInterpolation(AVFrame **frame, int scale, hipStream_t &stream)
 
     HIP_CHECK(hipStreamSynchronize(stream));
     HIP_CHECK(hipMemcpy2D(newFrame->data[0], newFrame->linesize[0], scaledYPlane, newWidth * sizeof(uint8_t), newWidth * sizeof(uint8_t), newHeight, hipMemcpyDeviceToHost));
-    HIP_CHECK(hipMemcpy2D(newFrame->data[1], newFrame->linesize[1], scaledUPlane, newChromaWidth * sizeof(uint8_t), newChromaWidth * sizeof(uint8_t), newChromaHeight, hipMemcpyDeviceToHost))
-    HIP_CHECK(hipMemcpy2D(newFrame->data[2], newFrame->linesize[2], scaledVPlane, newChromaWidth * sizeof(uint8_t), newChromaWidth * sizeof(uint8_t), newChromaHeight, hipMemcpyDeviceToHost))
+    HIP_CHECK(hipMemcpy2D(newFrame->data[1], newFrame->linesize[1], scaledUPlane, newChromaWidth * sizeof(uint8_t), newChromaWidth * sizeof(uint8_t), newChromaHeight, hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy2D(newFrame->data[2], newFrame->linesize[2], scaledVPlane, newChromaWidth * sizeof(uint8_t), newChromaWidth * sizeof(uint8_t), newChromaHeight, hipMemcpyDeviceToHost));
 
     av_frame_free(frame);
     *frame = newFrame;
 
+    cout << "finished frame" << endl;
     // DEBUG
     // {
     //     // Final dimensions
@@ -686,7 +824,78 @@ void bilinearInterpolation(AVFrame **frame, int scale, hipStream_t &stream)
 
     //     cout << "Created " << (*frame)->linesize[0] << " - " << (*frame)->width << " image" << endl;
     // }
+}
 
+void producer(VideoFFmpeg &video, int scale)
+{
+    video.startDecode();
+}
+
+void processor(VideoFFmpeg &video, int scale)
+{
+    AVFrame *frame = nullptr;
+    hipStream_t stream;
+    HIP_CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
+    pair<int, int> dimension = video.getDimension();
+    int width = dimension.first;
+    int height = dimension.second;
+
+    // divide 2 and ceil
+    int chromaWidth = (width + 1) / 2;
+    int chromaHeight = (height + 1) / 2;
+
+    uint8_t *YPlane = frame->data[0];
+    uint8_t *UPlane = frame->data[1];
+    uint8_t *VPlane = frame->data[2];
+
+    int YLinesize = frame->linesize[0];
+    int ULinesize = frame->linesize[1];
+    int VLinesize = frame->linesize[2];
+
+    // only index that has a "next" row or column can interpolate, so the last col of any row, and last row of any col will be a straight map
+    // a -1 because width and height is overlapping the very last index
+    int newWidth = ((width - 1) * scale) + 1;
+    int newHeight = ((height - 1) * scale) + 1;
+    int newPlaneSize = newWidth * newHeight;
+    // same idea here
+    int newChromaWidth = ((chromaWidth - 1) * scale) + 1;
+    int newChromaHeight = ((chromaHeight - 1) * scale) + 1;
+    int newChromaPlaneSize = newChromaWidth * newChromaHeight;
+
+    uint8_t *hipYPlane{};
+    uint8_t *hipUPlane{};
+    uint8_t *hipVPlane{};
+
+    uint8_t *scaledYPlane{};
+    uint8_t *scaledUPlane{};
+    uint8_t *scaledVPlane{};
+
+    HIP_CHECK(hipMalloc((void **)&hipYPlane, width * height * sizeof(uint8_t)));
+    HIP_CHECK(hipMalloc((void **)&hipUPlane, chromaWidth * chromaHeight * sizeof(uint8_t)));
+    HIP_CHECK(hipMalloc((void **)&hipVPlane, chromaWidth * chromaHeight * sizeof(uint8_t)));
+
+    HIP_CHECK(hipMalloc((void **)&scaledYPlane, newPlaneSize * sizeof(uint8_t)));
+    HIP_CHECK(hipMalloc((void **)&scaledUPlane, newChromaPlaneSize * sizeof(uint8_t)));
+    HIP_CHECK(hipMalloc((void **)&scaledVPlane, newChromaPlaneSize * sizeof(uint8_t)));
+
+    while (true)
+    {
+        cout << "getting frame" << endl;
+        frame = video.getFrame(AV_PIX_FMT_YUV420P);
+        cout << "got frame" << endl;
+        if (frame == nullptr)
+        {
+            cout << "breaking" << endl;
+            break;
+        }
+        cout << "processing frame" << endl;
+        bilinearInterpolation(&frame, scale, stream, hipYPlane, hipUPlane, hipVPlane, scaledYPlane, scaledUPlane, scaledVPlane);
+        cout << "finished processing frame" << endl;
+
+        video.addEncodeFrames(frame);
+    }
+
+    HIP_CHECK(hipStreamDestroy(stream));
     HIP_CHECK(hipFree(hipYPlane));
     HIP_CHECK(hipFree(hipUPlane));
     HIP_CHECK(hipFree(hipVPlane));
@@ -695,38 +904,20 @@ void bilinearInterpolation(AVFrame **frame, int scale, hipStream_t &stream)
     HIP_CHECK(hipFree(scaledVPlane));
 }
 
-void producer(VideoFFmpeg &video, int scale)
+void consumer(VideoFFmpeg &video, const char *fileName)
 {
-    video.startDecode();
-}
-
-void consumer(VideoFFmpeg &video, int scale)
-{
-    AVFrame *frame = nullptr;
-    hipStream_t stream;
-    HIP_CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
-
-    while (true)
-    {
-        frame = video.getFrame(AV_PIX_FMT_YUV420P);
-        if (frame == nullptr)
-            break;
-
-        bilinearInterpolation(&frame, scale, stream);
-
-        video.addEncodeFrames(frame);
-    }
-
-    HIP_CHECK(hipStreamDestroy(stream));
+    video.startEncode(fileName);
 }
 
 int main(int argc, char *argv[])
 {
-    int scale = 5;
+    // 4 threads total: main, producer, processor, consumer
+    int threadCount = max(static_cast<int>(MAX_THREADS), 4);
+    int scale = 2;
 
     HIP_CHECK(hipSetDevice(0)); // setting HIP device to default
 
-    VideoFFmpeg video("input.mp4");
+    VideoFFmpeg video("input.mp4", MAX_THREADS * 2);
     pair<int, int> dimension = video.getDimension();
     int scaledWidth = (dimension.first - 1) * scale + 1;
     int scaledHeight = (dimension.second - 1) * scale + 1;
@@ -736,28 +927,71 @@ int main(int argc, char *argv[])
 
     // ThreadTask tasks(MAX_THREADS - 1);
 
-    ThreadTask threads(MAX_THREADS - 1);
+    ThreadTask threads(threadCount - 1);
 
+    // cout << "Starting decode..." << endl;
+    // video.startDecode();
+    // cout << "Decode complete, starting upscale threads..." << endl;
+
+    // producer becomes processor once its finished with its task
     auto producerTask = [&video, scale]()
     {
         producer(video, scale);
-        consumer(video, scale);
+        cout << "producer finished" << endl;
+
+        // processor(video, scale);
     };
-    auto consumerTask = [&video, scale]()
+
+    auto processorTask = [&video, scale]()
     {
-        consumer(video, scale);
+        processor(video, scale);
+        cout << "processor finished" << endl;
     };
 
-    // first thread is producer
-    threads.addTask(new function<void()>(producerTask), 0);
+    auto consumerTask = [&video]()
+    {
+        consumer(video, "output.mp4");
+        cout << "consumer finished" << endl;
+    };
 
-    for (int i = 1; i < threads.size; i++)
-        threads.addTask(new function<void()>(consumerTask), i);
+    // one thread for producer and consumer
+    threads.addTask(new function<void()>(producerTask), 0);
+    threads.addTask(new function<void()>(consumerTask), 1);
+
+    // the rest are processors
+    for (int i = 2; i < threads.size; i++)
+        threads.addTask(new function<void()>(processorTask), i);
 
     threads.start();
-    threads.join();
 
-    video.startEncode("output.mp4", MAX_THREADS - 1);
+    cout << "Total threads created: " << threads.size << endl;
+    cout << "Joining processor threads from 2 to " << (threads.size - 1) << endl;
+
+    // once processors are all done, notify end to encoder
+    for (int i = 2; i < threads.size; i++)
+    {
+        cout << "Joining thread " << i << endl;
+        threads.join(i);
+        cout << "Thread " << i << " joined" << endl;
+    }
+
+    // this will allow the consumer/encoder thread to end (or else it will keep running forever)
+    cout << "calling encoder to end" << endl;
+    video.notifyEndEncode();
+
+    // Wait for the producer thread to finish
+    cout << "Joining producer thread (0)" << endl;
+    threads.join(0);
+    cout << "Producer thread joined" << endl;
+
+    // Wait for the consumer thread to finish
+    cout << "Joining consumer thread (1)" << endl;
+    threads.join(1);
+    cout << "Consumer thread joined" << endl;
+
+    cout << "All threads completed successfully" << endl;
+
+    return 0;
 
     // int count = 0;
     // while (true)
