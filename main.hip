@@ -26,6 +26,7 @@ extern "C"
 #include <functional>
 #include <hip/amd_detail/amd_hip_runtime.h>
 #include <utility>
+#include <algorithm>
 using std::function;
 using std::thread;
 using namespace std::chrono;
@@ -34,6 +35,7 @@ using std::condition_variable;
 using std::cout;
 using std::endl;
 using std::max;
+using std::min;
 using std::mutex;
 using std::pair;
 using std::priority_queue;
@@ -74,10 +76,6 @@ private:
 
     AVFormatContext *outFile;
     AVStream *outStream;
-
-    // FIXME: probably dont need this
-    mutex codecLocker;
-    condition_variable codecCV;
 
     AVCodecContext *decoder;
     condition_variable decoderCV; // NOTE: not for the buffer, its used by the decoder itself
@@ -127,6 +125,17 @@ private:
             this->raiseError("Failed to write header", fileCode);
     }
 
+    // this will change the threshold so that it remains at a level that the buffer barely gets to full
+    // this means that it will give the best accuracy possible for the performance
+    // also means that higher performance would impact accuracy, hence, minThreshold to guard accuracy
+    void encoderAdaptiveThreshold(int &threshold, int minThreshold = 0)
+    {
+        if (this->encodeBuffer.size() == BATCH_SIZE)
+        {
+            threshold = max(threshold - 1, minThreshold);
+        }
+    }
+
 public:
     VideoFFmpeg(string fileName, int batchSize, int decodeThreads = 0) : BATCH_SIZE(batchSize)
     {
@@ -156,22 +165,12 @@ public:
                 if ((codecCode = avcodec_open2(this->decoder, decoderInfo, nullptr)) < 0)
                     this->raiseError("Failed to start decoder", codecCode);
 
-                this->encoderCodec = avcodec_find_encoder(this->inFile->streams[i]->codecpar->codec_id);
-                if (this->encoderCodec == nullptr)
-                    this->encoderCodec = avcodec_find_encoder(AV_CODEC_ID_H264);
-
-                this->encoder = avcodec_alloc_context3(this->encoderCodec);
-
-                if (this->encoder == nullptr)
-                    this->raiseError("Failed to find encoder", codecCode);
-
-                this->encoder->time_base = this->inFile->streams[i]->time_base;
-
                 this->encoderInitialised = false; // need an initialise function
                 this->encodeEnded = false;
                 this->decoderFinished = false;
 
                 this->videoIndex = i;
+
                 break;
             }
         }
@@ -205,8 +204,6 @@ public:
         {
             if (packet->stream_index == this->videoIndex)
             {
-                unique_lock<mutex> codecLock(this->codecLocker);
-
                 // codec buffer is full, need to get decoded frames out
                 if ((sendCode = avcodec_send_packet(this->decoder, packet)) != 0)
                 {
@@ -260,9 +257,6 @@ public:
                 // FIXME: might fail when recvcode was EOF
                 if (sendCode != 0)
                     this->raiseError("Failed to decode frame", sendCode);
-
-                // TODO: notify one?
-                this->codecCV.notify_all();
             }
             av_packet_unref(packet);
         }
@@ -368,15 +362,40 @@ public:
         width &= ~1;
         height &= ~1;
 
+        this->encoderCodec = avcodec_find_encoder(this->inFile->streams[this->videoIndex]->codecpar->codec_id);
+        if (this->encoderCodec == nullptr)
+            this->encoderCodec = avcodec_find_encoder(AV_CODEC_ID_H264);
+
+        this->encoder = avcodec_alloc_context3(this->encoderCodec);
+
+        if (this->encoder == nullptr)
+            this->raiseError("Failed to find encoder");
+
+        this->encoder->time_base = this->inFile->streams[this->videoIndex]->time_base;
         this->encoder->width = width;
         this->encoder->height = height;
         this->encoder->pix_fmt = format;
+        this->encoder->framerate = av_guess_frame_rate(this->inFile, this->inFile->streams[this->videoIndex], nullptr);
+        this->encoder->max_b_frames = 0;
+        this->encoder->flags = 0;
 
-        // FIXME: remove
-        // this->encoder->color_range = AVCOL_RANGE_MPEG;
-        // this->encoder->colorspace = AVCOL_SPC_BT709;
-        // this->encoder->color_primaries = AVCOL_PRI_BT709;
-        // this->encoder->color_trc = AVCOL_TRC_BT709;
+        float fps = av_q2d(this->encoder->framerate);
+
+        int minGop = 12;
+        int maxGop = 300;
+        int gopSize;
+        if (fps <= 0)
+            gopSize = 30; // Fallback
+        else if (fps <= 15)
+            gopSize = (int)(fps * 2); // 2 seconds for low FPS
+        else if (fps <= 30)
+            gopSize = (int)(fps * 2); // 2 seconds for normal FPS
+        else
+            gopSize = (int)(fps * 1.5); // 1.5 seconds for high FPS
+
+        gopSize = max(min(maxGop, gopSize), minGop);
+
+        this->encoder->gop_size = gopSize;
 
         int decoderSize = this->decoder->width * this->decoder->height;
         int newSize = width * height;
@@ -420,15 +439,24 @@ public:
         unique_lock<mutex> lock(this->ebufferLocker);
         this->encodeEnded = true;
         this->ebufferCV.notify_all();
+        this->encoderCV.notify_all();
     }
 
-    void startEncode(const char *fileName, int threads = 0)
+    void startEncode(const char *fileName, float thresholdLevel, int threads = 0)
     {
         {
             unique_lock<mutex> lock(this->ebufferLocker);
             if (!this->encoderInitialised)
                 this->raiseError("Encoder not initialised");
         }
+
+        int64_t time_increment = this->encoder->time_base.den / this->encoder->framerate.num;
+        int64_t sequential_dts = 0;
+
+        // this threshold measures how many elements in the buffer at minimum to pick out a frame and encode
+        // the less frames there are, the more likely that the inordered frame as not arrived in the buffer yet
+        int threshold = this->BATCH_SIZE;
+        const int minThreshold = this->BATCH_SIZE * thresholdLevel;
 
         this->encoder->thread_count = threads;
         this->encoder->thread_type = FF_THREAD_FRAME;
@@ -453,100 +481,152 @@ public:
                     this->encoderCV.wait(lock);
                 }
 
-                // If we're ending and buffer is empty, break
+                // if its empty and ended, break, theres a step at the end that works with any remaining frames in the buffer
+                // TODO: might need to remove empty check
                 if (this->encodeEnded && this->encodeBuffer.empty())
                     break;
 
                 // only encode if the buffer has a threshold amount of frames
                 // NOTE: we are relying on the fact that if enough frames accumulate, the order will be near guarenteed
                 // ALSO NOTE: the buffer size of the encode and decode buffer is the same, so if we wait until buffer is full, then it is 100% guarenteed to be correct positions
-                int threshold = (this->BATCH_SIZE * 3) / 4;
+
+                encoderAdaptiveThreshold(threshold, minThreshold);
                 while (this->encodeBuffer.size() < threshold && !this->encodeEnded)
                 {
                     this->encoderCV.wait(lock);
                 }
 
-                // Take just one frame (the one with smallest PTS)
                 frame = this->encodeBuffer.top();
                 this->encodeBuffer.pop();
-                this->ebufferCV.notify_all(); // Wake up processors waiting for buffer space
+                this->ebufferCV.notify_all();
             }
 
-            // Encode this single frame
-            int codecCode = avcodec_send_frame(this->encoder, frame);
-            if (codecCode < 0)
-                this->raiseError("Error sending frame to encoder", codecCode);
-
-            AVPacket *pkt = av_packet_alloc();
-            while ((codecCode = avcodec_receive_packet(this->encoder, pkt)) == 0)
+            // send a frame, if it is successful go next
+            int codecCode;
+            if ((codecCode = avcodec_send_frame(this->encoder, frame)) == 0)
             {
-                pkt->stream_index = outStream->index;
-                av_interleaved_write_frame(this->outFile, pkt);
-                av_packet_unref(pkt);
+                av_frame_free(&frame);
+                continue;
             }
 
-            if (codecCode != AVERROR(EAGAIN) && codecCode != AVERROR_EOF)
-                this->raiseError("Error receiving packet from encoder", codecCode);
+            // from this point, a frame wasnt successfully sent to encoder
 
-            av_frame_free(&frame);
+            // time to drain
+            while (codecCode == AVERROR(EAGAIN))
+            {
+                int recvCode;
+                AVPacket *pkt = av_packet_alloc();
+                while ((recvCode = avcodec_receive_packet(this->encoder, pkt)) == 0)
+                {
+                    // getting a packet and processing it
+                    pkt->stream_index = outStream->index;
+                    pkt->dts = sequential_dts;
+                    pkt->pts = sequential_dts;
+                    sequential_dts += time_increment;
+                    av_interleaved_write_frame(this->outFile, pkt);
+                    av_packet_unref(pkt);
+
+                    // try to send the packet again, if its successful, no need to get more packets
+                    if ((codecCode = avcodec_send_frame(this->encoder, frame)) == 0)
+                    {
+                        av_frame_free(&frame);
+                        break;
+                    }
+                }
+
+                // definitely some sort of error if the encoder is full (cannot take frames) AND the encoder has no packets to give
+                if (recvCode == AVERROR(EAGAIN))
+                    this->raiseError("Error receiving packet from encoder", recvCode);
+
+                if (recvCode == AVERROR_EOF)
+                    this->raiseError("Something unexpected happened", recvCode);
+            }
+
+            // this shouldnt happen? because notification would always likely to come first
+            if (codecCode == AVERROR_EOF)
+                break;
+
+            else if (codecCode < 0)
+                this->raiseError("Error sending frame to encoder", codecCode);
         }
 
         // Process any remaining frames when ending
         {
             unique_lock<mutex> lock(this->ebufferLocker);
+            this->encodeBuffer.push(nullptr); // add to EOF encoder
             while (!this->encodeBuffer.empty())
             {
                 AVFrame *frame = this->encodeBuffer.top();
                 this->encodeBuffer.pop();
                 lock.unlock();
-                // unlock for encode
 
-                int codecCode = avcodec_send_frame(this->encoder, frame);
-                if (codecCode < 0)
-                    this->raiseError("Error sending remaining frame to encoder", codecCode);
-
-                AVPacket *pkt = av_packet_alloc();
-                while ((codecCode = avcodec_receive_packet(this->encoder, pkt)) == 0)
+                int codecCode;
+                if ((codecCode = avcodec_send_frame(this->encoder, frame)) == 0)
                 {
-                    pkt->stream_index = outStream->index;
-                    av_interleaved_write_frame(this->outFile, pkt);
-                    av_packet_unref(pkt);
+                    av_frame_free(&frame);
+                    continue;
                 }
 
-                if (codecCode != AVERROR(EAGAIN) && codecCode != AVERROR_EOF)
-                    this->raiseError("Error receiving packet from remaining frame", codecCode);
+                // from this point, a frame wasnt successfully sent to encoder
 
-                av_frame_free(&frame);
+                // time to drain
+                while (codecCode == AVERROR(EAGAIN))
+                {
+                    int recvCode;
+                    AVPacket *pkt = av_packet_alloc();
+                    while ((recvCode = avcodec_receive_packet(this->encoder, pkt)) == 0)
+                    {
+                        // getting a packet and processing it
+                        pkt->stream_index = outStream->index;
+                        pkt->dts = sequential_dts;
+                        pkt->pts = sequential_dts;
+                        sequential_dts += time_increment;
+                        av_interleaved_write_frame(this->outFile, pkt);
+                        av_packet_unref(pkt);
+
+                        // try to send the packet again, if its successful, no need to get more packets
+                        if ((codecCode = avcodec_send_frame(this->encoder, frame)) == 0)
+                        {
+                            av_frame_free(&frame);
+                            break;
+                        }
+                    }
+
+                    // definitely some sort of error if the encoder is full (cannot take frames) AND the encoder has no packets to give
+                    if (recvCode == AVERROR(EAGAIN))
+                        this->raiseError("Error receiving packet from encoder", recvCode);
+
+                    if (recvCode == AVERROR_EOF)
+                        this->raiseError("Something unexpected happened", recvCode);
+                }
+
+                if (codecCode == AVERROR_EOF)
+                    break;
+
+                else if (codecCode < 0)
+                    this->raiseError("Error sending frame to encoder", codecCode);
 
                 lock.lock(); // lock for checking while loop condition
             }
         }
 
-        // sending EOF to encoder
-        avcodec_send_frame(this->encoder, nullptr);
+        int ret;
 
         // just making sure all packets are recieved
         AVPacket *pkt = av_packet_alloc();
-        int ret;
         while ((ret = avcodec_receive_packet(this->encoder, pkt)) == 0)
         {
             pkt->stream_index = outStream->index;
+            pkt->dts = sequential_dts;
+            pkt->pts = sequential_dts;
+            sequential_dts += time_increment;
             av_interleaved_write_frame(this->outFile, pkt);
             av_packet_unref(pkt);
-            cout << "flushing" << endl;
         }
 
-        // Check if we exited due to EOF (expected) or an error
-        if (ret != AVERROR_EOF)
-        {
-            cout << "Encoder flush error: " << ret << endl;
-        }
-
-        cout << "finished flushing" << endl;
         av_packet_free(&pkt);
 
         // finish file
-        cout << "start ing write file" << endl;
         av_write_trailer(this->outFile);
         if (!(this->outFile->oformat->flags & AVFMT_NOFILE))
             avio_closep(&this->outFile->pb);
@@ -775,41 +855,6 @@ void bilinearInterpolation(AVFrame **frame, int scale, hipStream_t &stream, uint
 
     av_frame_free(frame);
     *frame = newFrame;
-
-    // DEBUG
-    // {
-    //     // Final dimensions
-    //     int finalWidth = ((width - 1) * scale) + 1;
-    //     int finalHeight = ((height - 1) * scale) + 1;
-
-    //     int chromaFinalWidth = ((chromaWidth - 1) * scale) + 1;
-    //     int chromaFinalHeight = ((chromaHeight - 1) * scale) + 1;
-
-    //     // Create PGM image
-    //     FILE *pgmFileY = fopen("outputy.pgm", "wb");
-    //     fprintf(pgmFileY, "P5\n%d %d\n255\n", finalWidth, finalHeight);
-    //     for (int y = 0; y < (*frame)->height; y++)
-    //     {
-    //         fwrite((*frame)->data[0] + y * (*frame)->linesize[0], 1, finalWidth, pgmFileY);
-    //     }
-    //     fclose(pgmFileY);
-
-    //     FILE *pgmFileU = fopen("outputu.pgm", "wb");
-    //     FILE *pgmFileV = fopen("outputv.pgm", "wb");
-    //     fprintf(pgmFileU, "P5\n%d %d\n255\n", chromaFinalWidth, chromaFinalHeight);
-    //     fprintf(pgmFileV, "P5\n%d %d\n255\n", chromaFinalWidth, chromaFinalHeight);
-
-    //     for (int y = 0; y < chromaFinalHeight; y++)
-    //     {
-    //         fwrite((*frame)->data[1] + y * (*frame)->linesize[1], 1, chromaFinalWidth, pgmFileU);
-    //         fwrite((*frame)->data[2] + y * (*frame)->linesize[2], 1, chromaFinalWidth, pgmFileV);
-    //     }
-    //     fclose(pgmFileU);
-
-    //     fclose(pgmFileV);
-
-    //     cout << "Created " << (*frame)->linesize[0] << " - " << (*frame)->width << " image" << endl;
-    // }
 }
 
 void producer(VideoFFmpeg &video, int scale)
@@ -885,20 +930,24 @@ void processor(VideoFFmpeg &video, int scale)
     HIP_CHECK(hipFree(scaledVPlane));
 }
 
-void consumer(VideoFFmpeg &video, const char *fileName)
+void consumer(VideoFFmpeg &video, const char *fileName, float thresholdLevel)
 {
-    video.startEncode(fileName);
+    video.startEncode(fileName, thresholdLevel);
 }
 
 int main(int argc, char *argv[])
 {
-    // 4 threads total: main, producer, processor, consumer
-    int threadCount = max(static_cast<int>(MAX_THREADS), 4);
+    // we need at least 3 threads total: producer, processor, consumer
+    int threadCount = max(static_cast<int>(MAX_THREADS), 3);
+    int processorCount = 1;
+    float thresholdLevel = 0.75;
     int scale = 2;
 
     HIP_CHECK(hipSetDevice(0)); // setting HIP device to default
 
-    VideoFFmpeg video("input.mp4", MAX_THREADS * 2);
+    // 4 is a good multiplier, idk tho, if u want accuracy, just make it slower
+    VideoFFmpeg video("input.mp4", MAX_THREADS * 4);
+
     pair<int, int> dimension = video.getDimension();
     int scaledWidth = (dimension.first - 1) * scale + 1;
     int scaledHeight = (dimension.second - 1) * scale + 1;
@@ -909,57 +958,39 @@ int main(int argc, char *argv[])
     auto producerTask = [&video, scale]()
     {
         producer(video, scale);
-        cout << "producer finished" << endl;
     };
 
     auto processorTask = [&video, scale]()
     {
         processor(video, scale);
-        cout << "processor finished" << endl;
     };
 
-    auto consumerTask = [&video]()
+    auto consumerTask = [&video, thresholdLevel]()
     {
-        consumer(video, "output.mp4");
-        cout << "consumer finished" << endl;
+        consumer(video, "output.mp4", thresholdLevel);
     };
 
-    // one thread for producer and consumer
-    threads.addTask(new function<void()>(producerTask), 0);
-    threads.addTask(new function<void()>(consumerTask), 1);
+    // one thread for consumer
+    threads.addTask(new function<void()>(consumerTask), 0);
 
     // the rest are processors
-    for (int i = 2; i < threads.size; i++)
+    for (int i = 1; i < processorCount + 1; i++)
         threads.addTask(new function<void()>(processorTask), i);
 
     threads.start();
 
-    cout << "Total threads created: " << threads.size << endl;
-    cout << "Joining processor threads from 2 to " << (threads.size - 1) << endl;
+    // main thread is the producer
+    producerTask();
 
     // once processors are all done, notify end to encoder
-    for (int i = 2; i < threads.size; i++)
-    {
-        cout << "Joining thread " << i << endl;
+    for (int i = 1; i < processorCount + 1; i++)
         threads.join(i);
-        cout << "Thread " << i << " joined" << endl;
-    }
 
     // this will allow the consumer/encoder thread to end (or else it will keep running forever)
-    cout << "calling encoder to end" << endl;
     video.notifyEndEncode();
 
-    // Wait for the producer thread to finish
-    cout << "Joining producer thread (0)" << endl;
-    threads.join(0);
-    cout << "Producer thread joined" << endl;
-
     // Wait for the consumer thread to finish
-    cout << "Joining consumer thread (1)" << endl;
-    threads.join(1);
-    cout << "Consumer thread joined" << endl;
-
-    cout << "All threads completed successfully" << endl;
+    threads.join(0);
 
     return 0;
 }
