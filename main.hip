@@ -101,6 +101,7 @@ private:
         exit(code);
     }
 
+    // opens encoder and sets up file
     void prepareEncode(const char *fileName)
     {
         int fileCode;
@@ -111,8 +112,19 @@ private:
         if (outStream == nullptr)
             this->raiseError("Error creating stream");
 
+        // set global header flag for containers that require it (like mkv)
+        if (this->outFile->oformat->flags & AVFMT_GLOBALHEADER)
+            this->encoder->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+
+        int codecCode;
+        if ((codecCode = avcodec_open2(this->encoder, this->encoderCodec, nullptr)) < 0)
+            this->raiseError("Failed to start encoder", codecCode);
+
         avcodec_parameters_from_context(this->outStream->codecpar, this->encoder);
         this->outStream->time_base = this->encoder->time_base;
+
+        this->outStream->r_frame_rate = this->encoder->framerate;
+        this->outStream->avg_frame_rate = this->encoder->framerate;
 
         // check if we need to explicity call avio_open for the file
         if (!(this->outFile->oformat->flags & AVFMT_NOFILE))
@@ -192,7 +204,13 @@ public:
 
     pair<int, int> getDimension()
     {
-        return pair<int, int>(this->decoder->width, this->decoder->height);
+
+        return pair<int, int>(this->inFile->streams[this->videoIndex]->codecpar->width, this->inFile->streams[this->videoIndex]->codecpar->height);
+    }
+
+    AVPixelFormat getPixelFormat()
+    {
+        return (enum AVPixelFormat)this->inFile->streams[this->videoIndex]->codecpar->format;
     }
 
     void startDecode()
@@ -227,7 +245,6 @@ public:
 
                         this->decodeBuffer.push(frame);
 
-                        // TODO: notify one?
                         // new frame incoming, wake all waiting for frame
                         this->dbufferCV.notify_all();
                     }
@@ -337,11 +354,6 @@ public:
             frame->width, frame->height, format,
             SWS_BICUBIC, nullptr, nullptr, nullptr);
 
-        // Set proper color range to avoid deprecated pixel format warnings
-        // int *inv_table, *table, srcRange, dstRange, brightness, contrast, saturation;
-        // sws_getColorspaceDetails(sws_ctx, &inv_table, &srcRange, &table, &dstRange, &brightness, &contrast, &saturation);
-        // sws_setColorspaceDetails(sws_ctx, inv_table, 1, table, 1, brightness, contrast, saturation);
-
         sws_scale(sws_ctx, frame->data, frame->linesize, 0, frame->height, convertedFrame->data, convertedFrame->linesize);
 
         sws_freeContext(sws_ctx);
@@ -362,50 +374,97 @@ public:
         width &= ~1;
         height &= ~1;
 
+        // try to find original codec, if not, theres a list of fallbacks
         this->encoderCodec = avcodec_find_encoder(this->inFile->streams[this->videoIndex]->codecpar->codec_id);
         if (this->encoderCodec == nullptr)
-            this->encoderCodec = avcodec_find_encoder(AV_CODEC_ID_H264);
+        {
+            // trying different ones, in order of most compatible
+            AVCodecID fallbackCodecs[] = {AV_CODEC_ID_H264, AV_CODEC_ID_H265, AV_CODEC_ID_VP9, AV_CODEC_ID_AV1};
+            for (AVCodecID codecId : fallbackCodecs)
+            {
+                this->encoderCodec = avcodec_find_encoder(codecId);
+                if (this->encoderCodec != nullptr)
+                    break;
+            }
+        }
+
+        if (this->encoderCodec == nullptr)
+            this->raiseError("No suitable encoder found");
 
         this->encoder = avcodec_alloc_context3(this->encoderCodec);
 
         if (this->encoder == nullptr)
             this->raiseError("Failed to find encoder");
 
-        this->encoder->time_base = this->inFile->streams[this->videoIndex]->time_base;
         this->encoder->width = width;
         this->encoder->height = height;
         this->encoder->pix_fmt = format;
-        this->encoder->framerate = av_guess_frame_rate(this->inFile, this->inFile->streams[this->videoIndex], nullptr);
         this->encoder->max_b_frames = 0;
         this->encoder->flags = 0;
 
+        this->encoder->framerate = this->inFile->streams[this->videoIndex]->r_frame_rate;
+
+        // fallback if framerate is invalid or sth
+        if (this->encoder->framerate.num == 0 || this->encoder->framerate.den == 0)
+        {
+            this->encoder->framerate = av_guess_frame_rate(this->inFile, this->inFile->streams[this->videoIndex], nullptr);
+        }
+
+        this->encoder->time_base = this->inFile->streams[this->videoIndex]->time_base;
+
+        // sometimes timebase is not divisble by framerate, and becomes wrong
+        AVRational timebase = this->inFile->streams[this->videoIndex]->time_base;
+        AVRational framerate = this->encoder->framerate;
+        float ratioRounded = round((float)(timebase.den * framerate.den) / (float)(timebase.num * framerate.num));
+        int newTimebaseDen = (float)(ratioRounded * framerate.num * timebase.num) / (float)framerate.den;
+        this->encoder->time_base.den = newTimebaseDen;
+
         float fps = av_q2d(this->encoder->framerate);
 
-        int minGop = 12;
-        int maxGop = 300;
-        int gopSize;
-        if (fps <= 0)
-            gopSize = 30; // Fallback
-        else if (fps <= 15)
-            gopSize = (int)(fps * 2); // 2 seconds for low FPS
-        else if (fps <= 30)
-            gopSize = (int)(fps * 2); // 2 seconds for normal FPS
-        else
-            gopSize = (int)(fps * 1.5); // 1.5 seconds for high FPS
+        // TODO: NOTE: i honestly have no idea what GOP size is, this is purely AI generated
+        // Set appropriate GOP size for different codecs
+        if (this->encoderCodec->id == AV_CODEC_ID_H264 || this->encoderCodec->id == AV_CODEC_ID_H265)
+        {
+            if (fps > 0)
+                this->encoder->gop_size = (int)(fps * 2); // 2 seconds GOP
+            else
+                this->encoder->gop_size = 50; // Default fallback
+        }
+        else if (this->encoderCodec->id == AV_CODEC_ID_VP9 || this->encoderCodec->id == AV_CODEC_ID_AV1)
+        {
+            if (fps > 0)
+                this->encoder->gop_size = (int)(fps * 1); // 1 second GOP for VP9/AV1
+            else
+                this->encoder->gop_size = 30;
+        }
 
-        gopSize = max(min(maxGop, gopSize), minGop);
+        int64_t fileSize_bits = avio_size(this->inFile->pb) * 8;            // original is in bytes
+        double fileDuration_s = (double)this->inFile->duration / 1000000.0; // original duration is in microsections
+        int fileBitrate = (int)(fileSize_bits / fileDuration_s);
 
-        this->encoder->gop_size = gopSize;
-
-        int decoderSize = this->decoder->width * this->decoder->height;
+        pair<int, int> fileDimension = this->getDimension();
+        int originalSize = fileDimension.first * fileDimension.second;
         int newSize = width * height;
 
-        float scale = (float)newSize / (float)decoderSize;
-        this->encoder->bit_rate = this->decoder->bit_rate * scale;
+        float scale = (float)newSize / (float)originalSize;
+        this->encoder->bit_rate = fileBitrate * scale;
 
         unique_lock<mutex> lock(this->ebufferLocker);
         this->encoderInitialised = true;
         this->ebufferCV.notify_all();
+
+        printf("=== ENCODER CONFIG ===\n");
+        printf("width: %d, height: %d\n", encoder->width, encoder->height);
+        printf("pix_fmt: %d\n", encoder->pix_fmt);
+        printf("time_base: %d/%d\n", encoder->time_base.num, encoder->time_base.den);
+        printf("framerate: %d/%d\n", encoder->framerate.num, encoder->framerate.den);
+        printf("bit_rate: %lld\n", encoder->bit_rate);
+        printf("gop_size: %d\n", encoder->gop_size);
+        printf("max_b_frames: %d\n", encoder->max_b_frames);
+        printf("thread_count: %d\n", encoder->thread_count);
+        printf("thread_type: %d\n", encoder->thread_type);
+        printf("flags: %d\n", encoder->flags);
+        printf("===================\n");
     }
 
     void addEncodeFrames(AVFrame *frame)
@@ -450,8 +509,9 @@ public:
                 this->raiseError("Encoder not initialised");
         }
 
-        int64_t time_increment = this->encoder->time_base.den / this->encoder->framerate.num;
-        int64_t sequential_dts = 0;
+        // With time_base = 1/framerate, each frame increment is simply 1
+        // int64_t time_increment = 1;
+        // int64_t sequential_dts = 0;
 
         // this threshold measures how many elements in the buffer at minimum to pick out a frame and encode
         // the less frames there are, the more likely that the inordered frame as not arrived in the buffer yet
@@ -460,10 +520,6 @@ public:
 
         this->encoder->thread_count = threads;
         this->encoder->thread_type = FF_THREAD_FRAME;
-
-        int codecCode;
-        if ((codecCode = avcodec_open2(this->encoder, this->encoderCodec, nullptr)) < 0)
-            this->raiseError("Failed to start encoder", codecCode);
 
         this->prepareEncode(fileName);
 
@@ -520,9 +576,10 @@ public:
                 {
                     // getting a packet and processing it
                     pkt->stream_index = outStream->index;
-                    pkt->dts = sequential_dts;
-                    pkt->pts = sequential_dts;
-                    sequential_dts += time_increment;
+                    // pkt->dts = sequential_dts;
+                    // pkt->pts = sequential_dts;
+                    // sequential_dts += time_increment;
+                    av_packet_rescale_ts(pkt, this->encoder->time_base, outStream->time_base);
                     av_interleaved_write_frame(this->outFile, pkt);
                     av_packet_unref(pkt);
 
@@ -578,9 +635,10 @@ public:
                     {
                         // getting a packet and processing it
                         pkt->stream_index = outStream->index;
-                        pkt->dts = sequential_dts;
-                        pkt->pts = sequential_dts;
-                        sequential_dts += time_increment;
+                        // pkt->dts = sequential_dts;
+                        // pkt->pts = sequential_dts;
+                        // sequential_dts += time_increment;
+                        av_packet_rescale_ts(pkt, this->encoder->time_base, outStream->time_base);
                         av_interleaved_write_frame(this->outFile, pkt);
                         av_packet_unref(pkt);
 
@@ -617,9 +675,10 @@ public:
         while ((ret = avcodec_receive_packet(this->encoder, pkt)) == 0)
         {
             pkt->stream_index = outStream->index;
-            pkt->dts = sequential_dts;
-            pkt->pts = sequential_dts;
-            sequential_dts += time_increment;
+            // pkt->dts = sequential_dts;
+            // pkt->pts = sequential_dts;
+            // sequential_dts += time_increment;
+            av_packet_rescale_ts(pkt, this->encoder->time_base, outStream->time_base);
             av_interleaved_write_frame(this->outFile, pkt);
             av_packet_unref(pkt);
         }
@@ -862,7 +921,7 @@ void producer(VideoFFmpeg &video, int scale)
     video.startDecode();
 }
 
-void processor(VideoFFmpeg &video, int scale)
+void processor(VideoFFmpeg &video, int scale, AVPixelFormat format)
 {
     AVFrame *frame = nullptr;
     hipStream_t stream;
@@ -911,7 +970,7 @@ void processor(VideoFFmpeg &video, int scale)
 
     while (true)
     {
-        frame = video.getFrame(AV_PIX_FMT_YUV420P);
+        frame = video.getFrame(format);
         if (frame == nullptr)
         {
             break;
@@ -935,23 +994,51 @@ void consumer(VideoFFmpeg &video, const char *fileName, float thresholdLevel)
     video.startEncode(fileName, thresholdLevel);
 }
 
+AVPixelFormat convertToYUV(AVPixelFormat format)
+{
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(format);
+    if (!desc)
+        return AV_PIX_FMT_NONE;
+
+    if (desc->log2_chroma_w == 0 && desc->log2_chroma_h == 0)
+        return AV_PIX_FMT_YUV444P;
+    else if (desc->log2_chroma_w == 1 && desc->log2_chroma_h == 0)
+        return AV_PIX_FMT_YUV422P;
+    else if (desc->log2_chroma_w == 1 && desc->log2_chroma_h == 1)
+        return AV_PIX_FMT_YUV420P;
+    else if (desc->log2_chroma_w == 0 && desc->log2_chroma_h == 1)
+        return AV_PIX_FMT_YUV440P;
+    else if (desc->log2_chroma_w == 2 && desc->log2_chroma_h == 0)
+        return AV_PIX_FMT_YUV411P;
+
+    return AV_PIX_FMT_NONE;
+}
+
 int main(int argc, char *argv[])
 {
+    // av_log_set_level(AV_LOG_ERROR);
+
     // we need at least 3 threads total: producer, processor, consumer
     int threadCount = max(static_cast<int>(MAX_THREADS), 3);
+
+    // settings
     int processorCount = 1;
     float thresholdLevel = 0.75;
     int scale = 2;
+    const char *input = "input.mkv";
+    const char *output = "output.mkv";
 
     HIP_CHECK(hipSetDevice(0)); // setting HIP device to default
 
     // 4 is a good multiplier, idk tho, if u want accuracy, just make it slower
-    VideoFFmpeg video("input.mp4", MAX_THREADS * 4);
+    VideoFFmpeg video(input, MAX_THREADS * 4);
+
+    AVPixelFormat format = convertToYUV(video.getPixelFormat());
 
     pair<int, int> dimension = video.getDimension();
     int scaledWidth = (dimension.first - 1) * scale + 1;
     int scaledHeight = (dimension.second - 1) * scale + 1;
-    video.initialiseEncoder(scaledWidth, scaledHeight, AV_PIX_FMT_YUV420P);
+    video.initialiseEncoder(scaledWidth, scaledHeight, format);
 
     ThreadTask threads(threadCount - 1);
 
@@ -960,14 +1047,14 @@ int main(int argc, char *argv[])
         producer(video, scale);
     };
 
-    auto processorTask = [&video, scale]()
+    auto processorTask = [&video, scale, format]()
     {
-        processor(video, scale);
+        processor(video, scale, format);
     };
 
-    auto consumerTask = [&video, thresholdLevel]()
+    auto consumerTask = [&video, output, thresholdLevel]()
     {
-        consumer(video, "output.mp4", thresholdLevel);
+        consumer(video, output, thresholdLevel);
     };
 
     // one thread for consumer
@@ -989,7 +1076,7 @@ int main(int argc, char *argv[])
     // this will allow the consumer/encoder thread to end (or else it will keep running forever)
     video.notifyEndEncode();
 
-    // Wait for the consumer thread to finish
+    // wait for the consumer thread to finish
     threads.join(0);
 
     return 0;
