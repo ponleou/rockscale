@@ -261,7 +261,6 @@ public:
 
     pair<int, int> getDimension()
     {
-
         return pair<int, int>(this->inFile->streams[this->videoIndex]->codecpar->width, this->inFile->streams[this->videoIndex]->codecpar->height);
     }
 
@@ -801,9 +800,11 @@ void processor(VideoFFmpeg &video, int scale, AVPixelFormat format)
     int height = dimension.second;
     int planeSize = width * height;
 
-    // divide 2 and ceil
-    int chromaWidth = (width + 1) / 2;
-    int chromaHeight = (height + 1) / 2;
+    // get chroma width and height
+    int wChromaShift, hChromaShift;
+    av_pix_fmt_get_chroma_sub_sample((enum AVPixelFormat)frame->format, &wChromaShift, &hChromaShift);
+    int chromaWidth = AV_CEIL_RSHIFT(frame->width, wChromaShift);
+    int chromaHeight = AV_CEIL_RSHIFT(frame->height, hChromaShift);
     int chromaPlaneSize = chromaHeight * chromaWidth;
 
     // only index that has a "next" row or column can interpolate, so the last col of any row, and last row of any col will be a straight map
