@@ -41,12 +41,31 @@ template <typename T, int K>
 class GPUMemory
 {
 private:
+    bool allocated;
     array<T *, K> memory;
+
+protected:
     array<int, K> sizes;
 
 public:
+    GPUMemory()
+    {
+        this->allocated = false;
+    }
+
     GPUMemory(const int (&sizes)[K])
     {
+        this->allocated = true;
+        copy(sizes, sizes + K, this->sizes.begin());
+        for (int i = 0; i < K; i++)
+            HIP_CHECK(hipMalloc((void **)&this->memory[i], this->sizes[i] * sizeof(T)));
+    }
+
+    void allocate(const int (&sizes)[K])
+    {
+        if (this->allocated)
+            throw invalid_argument("Memory is already allocated");
+
         copy(sizes, sizes + K, this->sizes.begin());
         for (int i = 0; i < K; i++)
             HIP_CHECK(hipMalloc((void **)&this->memory[i], this->sizes[i] * sizeof(T)));
@@ -66,7 +85,7 @@ public:
     }
 
     // allows function to check that memory sizes are as expected before passing to kernel
-    void validateMemorySizes(const int (&sizes)[K])
+    virtual void validateMemorySizes(const int (&sizes)[K])
     {
         for (int i = 0; i < K; i++)
             if (sizes[i] != this->sizes[i])

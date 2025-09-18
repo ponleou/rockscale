@@ -790,46 +790,20 @@ public:
 
 void processor(VideoFFmpeg &video, int scale, AVPixelFormat format)
 {
-    AVFrame *frame = nullptr;
+    AVFrame *frame = video.getFrame(format);
 
     hipStream_t stream;
     HIP_CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
 
-    pair<int, int> dimension = video.getDimension();
-    int width = dimension.first;
-    int height = dimension.second;
-    int planeSize = width * height;
+    BilinearGPUMemory bilinearMemory(frame, scale);
 
-    // get chroma width and height
-    int wChromaShift, hChromaShift;
-    av_pix_fmt_get_chroma_sub_sample((enum AVPixelFormat)frame->format, &wChromaShift, &hChromaShift);
-    int chromaWidth = AV_CEIL_RSHIFT(frame->width, wChromaShift);
-    int chromaHeight = AV_CEIL_RSHIFT(frame->height, hChromaShift);
-    int chromaPlaneSize = chromaHeight * chromaWidth;
-
-    // only index that has a "next" row or column can interpolate, so the last col of any row, and last row of any col will be a straight map
-    // a -1 because width and height is overlapping the very last index
-    int scaledWidth = ((width - 1) * scale) + 1;
-    int scaledHeight = ((height - 1) * scale) + 1;
-    int scaledPlaneSize = scaledWidth * scaledHeight;
-    // same idea here
-    int scaledChromaWidth = ((chromaWidth - 1) * scale) + 1;
-    int scaledChromaHeight = ((chromaHeight - 1) * scale) + 1;
-    int scaledChromaPlaneSize = scaledChromaWidth * scaledChromaHeight;
-
-    GPUMemory<uint8_t, 6> bilinearMemory({planeSize, chromaPlaneSize, chromaPlaneSize, scaledPlaneSize, scaledChromaPlaneSize, scaledChromaPlaneSize});
-
-    while (true)
+    do
     {
-        frame = video.getFrame(format);
-        if (frame == nullptr)
-        {
-            break;
-        }
         bilinearInterpolation(&frame, scale, stream, bilinearMemory);
-
         video.addEncodeFrames(frame);
-    }
+
+        frame = video.getFrame(format);
+    } while (frame != nullptr);
 
     HIP_CHECK(hipStreamDestroy(stream));
 }
