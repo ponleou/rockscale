@@ -30,10 +30,13 @@ extern "C"
 using std::function;
 using std::thread;
 using namespace std::chrono;
+using std::array;
 using std::cerr;
 using std::condition_variable;
+using std::copy;
 using std::cout;
 using std::endl;
+using std::invalid_argument;
 using std::max;
 using std::min;
 using std::mutex;
@@ -41,6 +44,7 @@ using std::pair;
 using std::priority_queue;
 using std::queue;
 using std::string;
+using std::to_string;
 using std::unique_lock;
 using std::vector;
 
@@ -883,22 +887,53 @@ __global__ void linearColumnInterpolate(unsigned char *rowInterpolated, const in
     }
 }
 
-void bilinearInterpolation(AVFrame **frame, int scale, hipStream_t &stream, uint8_t *hipYPlane, uint8_t *hipUPlane, uint8_t *hipVPlane, uint8_t *scaledYPlane, uint8_t *scaledUPlane, uint8_t *scaledVPlane)
+template <typename T, int K>
+class GPUMemory
+{
+private:
+    array<T *, K> memory;
+    array<int, K> sizes;
+
+public:
+    GPUMemory(const int (&sizes)[K])
+    {
+        copy(sizes, sizes + K, this->sizes.begin());
+        for (int i = 0; i < K; i++)
+            HIP_CHECK(hipMalloc((void **)&this->memory[i], this->sizes[i] * sizeof(T)));
+    }
+
+    ~GPUMemory()
+    {
+        for (int i = 0; i < K; i++)
+        {
+            HIP_CHECK(hipFree(this->memory[i]));
+        }
+    }
+
+    T *&operator[](int index)
+    {
+        return this->memory[index];
+    }
+
+    // allows function to check that memory sizes are as expected before passing to kernel
+    void validateMemorySizes(const int (&sizes)[K])
+    {
+        for (int i = 0; i < K; i++)
+            if (sizes[i] != this->sizes[i])
+                throw invalid_argument("Memory sizes don't match at index " + to_string(i));
+    }
+};
+
+void bilinearInterpolation(AVFrame **frame, int scale, hipStream_t &stream, GPUMemory<uint8_t, 6> &memory)
 {
     int width = (*frame)->width;
     int height = (*frame)->height;
+    int planeSize = width * height;
 
     // divide 2 and ceil
     int chromaWidth = (width + 1) / 2;
     int chromaHeight = (height + 1) / 2;
-
-    uint8_t *YPlane = (*frame)->data[0];
-    uint8_t *UPlane = (*frame)->data[1];
-    uint8_t *VPlane = (*frame)->data[2];
-
-    int YLinesize = (*frame)->linesize[0];
-    int ULinesize = (*frame)->linesize[1];
-    int VLinesize = (*frame)->linesize[2];
+    int chromaPlaneSize = chromaHeight * chromaWidth;
 
     // only index that has a "next" row or column can interpolate, so the last col of any row, and last row of any col will be a straight map
     // a -1 because width and height is overlapping the very last index
@@ -910,23 +945,33 @@ void bilinearInterpolation(AVFrame **frame, int scale, hipStream_t &stream, uint
     int newChromaHeight = ((chromaHeight - 1) * scale) + 1;
     int newChromaPlaneSize = newChromaWidth * newChromaHeight;
 
-    HIP_CHECK(hipMemcpy2DAsync(hipYPlane, width * sizeof(uint8_t), YPlane, YLinesize, width * sizeof(uint8_t), height, hipMemcpyHostToDevice, stream));
-    HIP_CHECK(hipMemcpy2DAsync(hipUPlane, chromaWidth * sizeof(uint8_t), UPlane, ULinesize, chromaWidth * sizeof(uint8_t), chromaHeight, hipMemcpyHostToDevice, stream));
-    HIP_CHECK(hipMemcpy2DAsync(hipVPlane, chromaWidth * sizeof(uint8_t), VPlane, VLinesize, chromaWidth * sizeof(uint8_t), chromaHeight, hipMemcpyHostToDevice, stream));
+    memory.validateMemorySizes({planeSize, chromaPlaneSize, chromaPlaneSize, newPlaneSize, newChromaPlaneSize, newChromaPlaneSize});
+
+    uint8_t *YPlane = (*frame)->data[0];
+    uint8_t *UPlane = (*frame)->data[1];
+    uint8_t *VPlane = (*frame)->data[2];
+
+    int YLinesize = (*frame)->linesize[0];
+    int ULinesize = (*frame)->linesize[1];
+    int VLinesize = (*frame)->linesize[2];
+
+    HIP_CHECK(hipMemcpy2DAsync(memory[0], width * sizeof(uint8_t), YPlane, YLinesize, width * sizeof(uint8_t), height, hipMemcpyHostToDevice, stream));
+    HIP_CHECK(hipMemcpy2DAsync(memory[1], chromaWidth * sizeof(uint8_t), UPlane, ULinesize, chromaWidth * sizeof(uint8_t), chromaHeight, hipMemcpyHostToDevice, stream));
+    HIP_CHECK(hipMemcpy2DAsync(memory[2], chromaWidth * sizeof(uint8_t), VPlane, VLinesize, chromaWidth * sizeof(uint8_t), chromaHeight, hipMemcpyHostToDevice, stream));
 
     int threadsPerBlock = 256;
 
     int rowThreadCountY = width * height;
     int rowNumBlocksY = ceil((float)rowThreadCountY / (float)threadsPerBlock);
-    void *rowArgsY[] = {&hipYPlane, &scaledYPlane, &width, &width, &height, &scale};
+    void *rowArgsY[] = {&memory[0], &memory[3], &width, &width, &height, &scale};
 
     int rowThreadCountU = chromaWidth * chromaHeight;
     int rowNumBlocksU = ceil((float)rowThreadCountU / (float)threadsPerBlock);
-    void *rowArgsU[] = {&hipUPlane, &scaledUPlane, &chromaWidth, &chromaWidth, &chromaHeight, &scale};
+    void *rowArgsU[] = {&memory[1], &memory[4], &chromaWidth, &chromaWidth, &chromaHeight, &scale};
 
     int rowThreadCountV = chromaWidth * chromaHeight;
     int rowNumBlocksV = ceil((float)rowThreadCountV / (float)threadsPerBlock);
-    void *rowArgsV[] = {&hipVPlane, &scaledVPlane, &chromaWidth, &chromaWidth, &chromaHeight, &scale};
+    void *rowArgsV[] = {&memory[2], &memory[5], &chromaWidth, &chromaWidth, &chromaHeight, &scale};
 
     HIP_CHECK(hipLaunchKernel((const void *)linearRowInterpolate, dim3(rowNumBlocksY), dim3(threadsPerBlock), rowArgsY, 0, stream));
     HIP_CHECK(hipLaunchKernel((const void *)linearRowInterpolate, dim3(rowNumBlocksU), dim3(threadsPerBlock), rowArgsU, 0, stream));
@@ -934,15 +979,15 @@ void bilinearInterpolation(AVFrame **frame, int scale, hipStream_t &stream, uint
 
     int colThreadCountY = newWidth * (height - 1);
     int colNumBlocksY = ceil((float)colThreadCountY / (float)threadsPerBlock);
-    void *colArgsY[] = {&scaledYPlane, &newWidth, &newHeight, &scale};
+    void *colArgsY[] = {&memory[3], &newWidth, &newHeight, &scale};
 
     int colThreadCountU = newChromaWidth * (chromaHeight - 1);
     int colNumBlocksU = ceil((float)colThreadCountU / (float)threadsPerBlock);
-    void *colArgsU[] = {&scaledUPlane, &newChromaWidth, &newChromaHeight, &scale};
+    void *colArgsU[] = {&memory[4], &newChromaWidth, &newChromaHeight, &scale};
 
     int colThreadCountV = newChromaWidth * (chromaHeight - 1);
     int colNumBlocksV = ceil((float)colThreadCountV / (float)threadsPerBlock);
-    void *colArgsV[] = {&scaledVPlane, &newChromaWidth, &newChromaHeight, &scale};
+    void *colArgsV[] = {&memory[5], &newChromaWidth, &newChromaHeight, &scale};
 
     HIP_CHECK(hipStreamSynchronize(stream));
     HIP_CHECK(hipLaunchKernel((const void *)linearColumnInterpolate, dim3(colNumBlocksY), dim3(threadsPerBlock), colArgsY, 0, stream));
@@ -957,65 +1002,42 @@ void bilinearInterpolation(AVFrame **frame, int scale, hipStream_t &stream, uint
     av_frame_get_buffer(newFrame, 0);
 
     HIP_CHECK(hipStreamSynchronize(stream));
-    HIP_CHECK(hipMemcpy2D(newFrame->data[0], newFrame->linesize[0], scaledYPlane, newWidth * sizeof(uint8_t), newWidth * sizeof(uint8_t), newHeight, hipMemcpyDeviceToHost));
-    HIP_CHECK(hipMemcpy2D(newFrame->data[1], newFrame->linesize[1], scaledUPlane, newChromaWidth * sizeof(uint8_t), newChromaWidth * sizeof(uint8_t), newChromaHeight, hipMemcpyDeviceToHost));
-    HIP_CHECK(hipMemcpy2D(newFrame->data[2], newFrame->linesize[2], scaledVPlane, newChromaWidth * sizeof(uint8_t), newChromaWidth * sizeof(uint8_t), newChromaHeight, hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy2D(newFrame->data[0], newFrame->linesize[0], memory[3], newWidth * sizeof(uint8_t), newWidth * sizeof(uint8_t), newHeight, hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy2D(newFrame->data[1], newFrame->linesize[1], memory[4], newChromaWidth * sizeof(uint8_t), newChromaWidth * sizeof(uint8_t), newChromaHeight, hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy2D(newFrame->data[2], newFrame->linesize[2], memory[5], newChromaWidth * sizeof(uint8_t), newChromaWidth * sizeof(uint8_t), newChromaHeight, hipMemcpyDeviceToHost));
 
     av_frame_free(frame);
     *frame = newFrame;
 }
 
-void producer(VideoFFmpeg &video, int scale)
-{
-    video.startDecode();
-}
-
 void processor(VideoFFmpeg &video, int scale, AVPixelFormat format)
 {
     AVFrame *frame = nullptr;
+
     hipStream_t stream;
     HIP_CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
+
     pair<int, int> dimension = video.getDimension();
     int width = dimension.first;
     int height = dimension.second;
+    int planeSize = width * height;
 
     // divide 2 and ceil
     int chromaWidth = (width + 1) / 2;
     int chromaHeight = (height + 1) / 2;
-
-    uint8_t *YPlane = frame->data[0];
-    uint8_t *UPlane = frame->data[1];
-    uint8_t *VPlane = frame->data[2];
-
-    int YLinesize = frame->linesize[0];
-    int ULinesize = frame->linesize[1];
-    int VLinesize = frame->linesize[2];
+    int chromaPlaneSize = chromaHeight * chromaWidth;
 
     // only index that has a "next" row or column can interpolate, so the last col of any row, and last row of any col will be a straight map
     // a -1 because width and height is overlapping the very last index
-    int newWidth = ((width - 1) * scale) + 1;
-    int newHeight = ((height - 1) * scale) + 1;
-    int newPlaneSize = newWidth * newHeight;
+    int scaledWidth = ((width - 1) * scale) + 1;
+    int scaledHeight = ((height - 1) * scale) + 1;
+    int scaledPlaneSize = scaledWidth * scaledHeight;
     // same idea here
-    int newChromaWidth = ((chromaWidth - 1) * scale) + 1;
-    int newChromaHeight = ((chromaHeight - 1) * scale) + 1;
-    int newChromaPlaneSize = newChromaWidth * newChromaHeight;
+    int scaledChromaWidth = ((chromaWidth - 1) * scale) + 1;
+    int scaledChromaHeight = ((chromaHeight - 1) * scale) + 1;
+    int scaledChromaPlaneSize = scaledChromaWidth * scaledChromaHeight;
 
-    uint8_t *hipYPlane{};
-    uint8_t *hipUPlane{};
-    uint8_t *hipVPlane{};
-
-    uint8_t *scaledYPlane{};
-    uint8_t *scaledUPlane{};
-    uint8_t *scaledVPlane{};
-
-    HIP_CHECK(hipMalloc((void **)&hipYPlane, width * height * sizeof(uint8_t)));
-    HIP_CHECK(hipMalloc((void **)&hipUPlane, chromaWidth * chromaHeight * sizeof(uint8_t)));
-    HIP_CHECK(hipMalloc((void **)&hipVPlane, chromaWidth * chromaHeight * sizeof(uint8_t)));
-
-    HIP_CHECK(hipMalloc((void **)&scaledYPlane, newPlaneSize * sizeof(uint8_t)));
-    HIP_CHECK(hipMalloc((void **)&scaledUPlane, newChromaPlaneSize * sizeof(uint8_t)));
-    HIP_CHECK(hipMalloc((void **)&scaledVPlane, newChromaPlaneSize * sizeof(uint8_t)));
+    GPUMemory<uint8_t, 6> bilinearMemory({planeSize, chromaPlaneSize, chromaPlaneSize, scaledPlaneSize, scaledChromaPlaneSize, scaledChromaPlaneSize});
 
     while (true)
     {
@@ -1024,18 +1046,17 @@ void processor(VideoFFmpeg &video, int scale, AVPixelFormat format)
         {
             break;
         }
-        bilinearInterpolation(&frame, scale, stream, hipYPlane, hipUPlane, hipVPlane, scaledYPlane, scaledUPlane, scaledVPlane);
+        bilinearInterpolation(&frame, scale, stream, bilinearMemory);
 
         video.addEncodeFrames(frame);
     }
 
     HIP_CHECK(hipStreamDestroy(stream));
-    HIP_CHECK(hipFree(hipYPlane));
-    HIP_CHECK(hipFree(hipUPlane));
-    HIP_CHECK(hipFree(hipVPlane));
-    HIP_CHECK(hipFree(scaledYPlane));
-    HIP_CHECK(hipFree(scaledUPlane));
-    HIP_CHECK(hipFree(scaledVPlane));
+}
+
+void producer(VideoFFmpeg &video, int scale)
+{
+    video.startDecode();
 }
 
 void consumer(VideoFFmpeg &video, const char *fileName, float thresholdLevel)
@@ -1043,6 +1064,7 @@ void consumer(VideoFFmpeg &video, const char *fileName, float thresholdLevel)
     video.startEncode(fileName, thresholdLevel);
 }
 
+// just matching whatever format it is with the correct chroma size, but in YUV
 AVPixelFormat convertToYUV(AVPixelFormat format)
 {
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(format);
@@ -1068,19 +1090,19 @@ int main(int argc, char *argv[])
     av_log_set_level(AV_LOG_DEBUG);
 
     // we need at least 3 threads total: producer, processor, consumer
-    int threadCount = max(static_cast<int>(MAX_THREADS), 3);
+    int usableThreads = max(static_cast<int>(MAX_THREADS), 3);
 
     // settings
     int processorCount = 1;
     float thresholdLevel = 0.75;
     int scale = 2;
-    const char *input = "input.mkv";
-    const char *output = "output.mkv";
+    const char *input = "input.mp4";
+    const char *output = "output.mp4";
 
     HIP_CHECK(hipSetDevice(0)); // setting HIP device to default
 
     // 4 is a good multiplier, idk tho, if u want accuracy, just make it slower
-    VideoFFmpeg video(input, MAX_THREADS * 4);
+    VideoFFmpeg video(input, processorCount * 4);
 
     AVPixelFormat format = convertToYUV(video.getPixelFormat());
 
@@ -1089,7 +1111,8 @@ int main(int argc, char *argv[])
     int scaledHeight = (dimension.second - 1) * scale + 1;
     video.initialiseEncoder(scaledWidth, scaledHeight, format);
 
-    ThreadTask threads(threadCount - 1);
+    int threadCount = min(usableThreads, processorCount + 2); // +2 because one for consumer one for producer
+    ThreadTask threads(threadCount - 1);                      // -1 because producer is running in main thread
 
     auto producerTask = [&video, scale]()
     {
@@ -1110,7 +1133,7 @@ int main(int argc, char *argv[])
     threads.addTask(new function<void()>(consumerTask), 0);
 
     // the rest are processors
-    for (int i = 1; i < processorCount + 1; i++)
+    for (int i = 1; i < threads.size; i++)
         threads.addTask(new function<void()>(processorTask), i);
 
     threads.start();
@@ -1119,7 +1142,7 @@ int main(int argc, char *argv[])
     producerTask();
 
     // once processors are all done, notify end to encoder
-    for (int i = 1; i < processorCount + 1; i++)
+    for (int i = 1; i < threads.size; i++)
         threads.join(i);
 
     // this will allow the consumer/encoder thread to end (or else it will keep running forever)
