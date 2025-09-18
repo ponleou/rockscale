@@ -79,6 +79,53 @@ __global__ void linearColumnInterpolate(unsigned char *row_interpolated, const i
     }
 }
 
+class BilinearGPUMemory : public GPUMemory<uint8_t, 6>
+{
+public:
+    BilinearGPUMemory(const AVFrame *frame, int scale)
+    {
+        int width = frame->width;
+        int height = frame->height;
+        int planeSize = width * height;
+
+        // get chroma width and height
+        int wChromaShift, hChromaShift;
+        av_pix_fmt_get_chroma_sub_sample((enum AVPixelFormat)frame->format, &wChromaShift, &hChromaShift);
+        int chromaWidth = AV_CEIL_RSHIFT(frame->width, wChromaShift);
+        int chromaHeight = AV_CEIL_RSHIFT(frame->height, hChromaShift);
+        int chromaPlaneSize = chromaHeight * chromaWidth;
+
+        // only index that has a "next" row or column can interpolate, so the last col of any row, and last row of any col will be a straight map
+        // a -1 because width and height is overlapping the very last index
+        int scaledWidth = ((width - 1) * scale) + 1;
+        int scaledHeight = ((height - 1) * scale) + 1;
+        int scaledPlaneSize = scaledWidth * scaledHeight;
+        // same idea here
+        int scaledChromaWidth = ((chromaWidth - 1) * scale) + 1;
+        int scaledChromaHeight = ((chromaHeight - 1) * scale) + 1;
+        int scaledChromaPlaneSize = scaledChromaWidth * scaledChromaHeight;
+
+        this->allocate({planeSize, chromaPlaneSize, chromaPlaneSize, scaledPlaneSize, scaledChromaPlaneSize, scaledChromaPlaneSize});
+    }
+
+    enum MemoryPosition
+    {
+        Y_PLANE,
+        U_PLANE,
+        V_PLANE,
+        OUTPUT_Y_PLANE,
+        OUTPUT_U_PLANE,
+        OUTPUT_V_PLANE,
+    };
+
+    void validateMemorySizes(const int (&sizes)[6]) override
+    {
+        for (int i = 0; i < 6; i++)
+            if (sizes[i] != this->sizes[i])
+                throw invalid_argument("Memory sizes don't match at index " + to_string(i) + ", potential mismatched frames");
+    }
+};
+
 void bilinearInterpolation(AVFrame **frame, int scale, hipStream_t &stream, GPUMemory<uint8_t, 6> &memory)
 {
     int width = (*frame)->width;
@@ -166,50 +213,3 @@ void bilinearInterpolation(AVFrame **frame, int scale, hipStream_t &stream, GPUM
     av_frame_free(frame);
     *frame = newFrame;
 }
-
-class BilinearGPUMemory : public GPUMemory<uint8_t, 6>
-{
-public:
-    BilinearGPUMemory(const AVFrame *frame, int scale)
-    {
-        int width = frame->width;
-        int height = frame->height;
-        int planeSize = width * height;
-
-        // get chroma width and height
-        int wChromaShift, hChromaShift;
-        av_pix_fmt_get_chroma_sub_sample((enum AVPixelFormat)frame->format, &wChromaShift, &hChromaShift);
-        int chromaWidth = AV_CEIL_RSHIFT(frame->width, wChromaShift);
-        int chromaHeight = AV_CEIL_RSHIFT(frame->height, hChromaShift);
-        int chromaPlaneSize = chromaHeight * chromaWidth;
-
-        // only index that has a "next" row or column can interpolate, so the last col of any row, and last row of any col will be a straight map
-        // a -1 because width and height is overlapping the very last index
-        int scaledWidth = ((width - 1) * scale) + 1;
-        int scaledHeight = ((height - 1) * scale) + 1;
-        int scaledPlaneSize = scaledWidth * scaledHeight;
-        // same idea here
-        int scaledChromaWidth = ((chromaWidth - 1) * scale) + 1;
-        int scaledChromaHeight = ((chromaHeight - 1) * scale) + 1;
-        int scaledChromaPlaneSize = scaledChromaWidth * scaledChromaHeight;
-
-        this->allocate({planeSize, chromaPlaneSize, chromaPlaneSize, scaledPlaneSize, scaledChromaPlaneSize, scaledChromaPlaneSize});
-    }
-
-    enum MemoryPosition
-    {
-        Y_PLANE,
-        U_PLANE,
-        V_PLANE,
-        OUTPUT_Y_PLANE,
-        OUTPUT_U_PLANE,
-        OUTPUT_V_PLANE,
-    };
-
-    void validateMemorySizes(const int (&sizes)[6]) override
-    {
-        for (int i = 0; i < 6; i++)
-            if (sizes[i] != this->sizes[i])
-                throw invalid_argument("Memory sizes don't match at index " + to_string(i) + ", potential mismatched frames");
-    }
-};

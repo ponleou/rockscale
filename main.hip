@@ -7,6 +7,7 @@ extern "C"
 }
 
 #include "interpolations/bilinear.hpp"
+#include "interpolations/bicubic.hpp"
 
 #include <mutex>
 #include <string>
@@ -796,10 +797,13 @@ void processor(VideoFFmpeg &video, int scale, AVPixelFormat format)
     HIP_CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
 
     BilinearGPUMemory bilinearMemory(frame, scale);
+    BicubicGPUMemory bicubicMemory(frame, scale);
+    BicubicTangentGPUMemory bicubicTangent(frame, scale);
 
     do
     {
-        bilinearInterpolation(&frame, scale, stream, bilinearMemory);
+        // bilinearInterpolation(&frame, scale, stream, bilinearMemory);
+        bicubicInterpolation(&frame, scale, stream, bicubicMemory, bicubicTangent);
         video.addEncodeFrames(frame);
 
         frame = video.getFrame(format);
@@ -849,9 +853,9 @@ int main(int argc, char *argv[])
     // settings
     int processorCount = 1;
     float thresholdLevel = 0.75;
-    int scale = 2;
-    const char *input = "input.mp4";
-    const char *output = "output.mp4";
+    int scale = 5;
+    const char *input = "input.mov";
+    const char *output = "output.mov";
 
     HIP_CHECK(hipSetDevice(0)); // setting HIP device to default
 

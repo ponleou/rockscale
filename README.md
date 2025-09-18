@@ -5,6 +5,7 @@
 -   [ ] gpu device
 -   [ ] inputted flags (including threads used)
 -   [ ] scaling to different pixel format (swsscaler)
+-   [ ] fallback encoder
 
 ### flags
 
