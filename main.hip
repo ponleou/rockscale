@@ -72,10 +72,11 @@ private:
 
     const int BATCH_SIZE;
     AVFormatContext *inFile;
+    AVFormatContext *mergeInFile; // Separate input file for mergeStreams
     int videoIndex;
 
     AVFormatContext *outFile;
-    AVStream *outStream;
+    vector<AVStream *> outStreamsOrdered; // this contains outFile's stream in order of inFile's streams
 
     AVCodecContext *decoder;
     condition_variable decoderCV; // NOTE: not for the buffer, its used by the decoder itself
@@ -101,6 +102,43 @@ private:
         exit(code);
     }
 
+    // interleaved packets until we put the passed videopacket, then we return and wait for the next ones
+    void mergeStreams(AVPacket *videoPacket)
+    {
+        AVPacket *pkt = av_packet_alloc();
+
+        while (av_read_frame(this->mergeInFile, pkt) >= 0)
+        {
+
+            AVStream *inStream = this->mergeInFile->streams[pkt->stream_index];
+            AVStream *outStream = this->outStreamsOrdered[pkt->stream_index];
+
+            if (pkt->stream_index == this->videoIndex)
+            {
+                // Copy the original video packet's timing to our encoded packet
+                videoPacket->pts = av_rescale_q_rnd(pkt->pts, inStream->time_base, outStream->time_base, (AVRounding)(AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
+                videoPacket->dts = av_rescale_q_rnd(pkt->dts, inStream->time_base, outStream->time_base, (AVRounding)(AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
+                videoPacket->duration = av_rescale_q(pkt->duration, inStream->time_base, outStream->time_base);
+
+                av_interleaved_write_frame(this->outFile, videoPacket);
+                av_packet_unref(videoPacket);
+                av_packet_unref(pkt);
+                av_packet_free(&pkt);
+
+                return;
+            }
+
+            pkt->pts = av_rescale_q_rnd(pkt->pts, inStream->time_base, outStream->time_base, (AVRounding)(AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
+            pkt->dts = av_rescale_q_rnd(pkt->dts, inStream->time_base, outStream->time_base, (AVRounding)(AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
+            pkt->duration = av_rescale_q(pkt->duration, inStream->time_base, outStream->time_base);
+            pkt->pos = -1;
+
+            av_interleaved_write_frame(this->outFile, pkt);
+            av_packet_unref(pkt);
+        }
+        av_packet_free(&pkt);
+    }
+
     // opens encoder and sets up file
     void prepareEncode(const char *fileName)
     {
@@ -108,23 +146,51 @@ private:
         if ((fileCode = avformat_alloc_output_context2(&this->outFile, nullptr, nullptr, fileName)) < 0 || this->outFile == nullptr)
             this->raiseError("Error setting up output file", fileCode);
 
-        this->outStream = avformat_new_stream(this->outFile, nullptr);
-        if (outStream == nullptr)
-            this->raiseError("Error creating stream");
+        // setup streams
+        for (unsigned int i = 0; i < this->inFile->nb_streams; i++)
+        {
+            // prepate video stream for output file
+            if (i == this->videoIndex)
+            {
+                AVStream *outputStream = avformat_new_stream(this->outFile, nullptr);
+                if (outputStream == nullptr)
+                    this->raiseError("Error creating stream");
+
+                // just pushing for index, wont actually be used
+                this->outStreamsOrdered.push_back(outputStream);
+            }
+            // other streams
+            else
+            {
+                AVStream *inputStream = this->inFile->streams[i];
+                AVStream *outputStream = avformat_new_stream(this->outFile, nullptr);
+
+                if (outputStream == nullptr)
+                    this->raiseError("Error creating stream");
+
+                avcodec_parameters_copy(outputStream->codecpar, inputStream->codecpar);
+                outputStream->time_base = inputStream->time_base;
+                outputStream->r_frame_rate = inputStream->r_frame_rate;
+                outputStream->avg_frame_rate = inputStream->avg_frame_rate;
+
+                this->outStreamsOrdered.push_back(outputStream);
+            }
+        }
 
         // set global header flag for containers that require it (like mkv)
         if (this->outFile->oformat->flags & AVFMT_GLOBALHEADER)
             this->encoder->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 
+        // open encoder
         int codecCode;
         if ((codecCode = avcodec_open2(this->encoder, this->encoderCodec, nullptr)) < 0)
             this->raiseError("Failed to start encoder", codecCode);
 
-        avcodec_parameters_from_context(this->outStream->codecpar, this->encoder);
-        this->outStream->time_base = this->encoder->time_base;
-
-        this->outStream->r_frame_rate = this->encoder->framerate;
-        this->outStream->avg_frame_rate = this->encoder->framerate;
+        // setup video stream
+        avcodec_parameters_from_context(this->outStreamsOrdered[this->videoIndex]->codecpar, this->encoder);
+        this->outStreamsOrdered[this->videoIndex]->time_base = this->encoder->time_base;
+        this->outStreamsOrdered[this->videoIndex]->r_frame_rate = this->encoder->framerate;
+        this->outStreamsOrdered[this->videoIndex]->avg_frame_rate = this->encoder->framerate;
 
         // check if we need to explicity call avio_open for the file
         if (!(this->outFile->oformat->flags & AVFMT_NOFILE))
@@ -133,6 +199,7 @@ private:
                 this->raiseError("Failed to open output file", fileCode);
         }
 
+        // write file header
         if ((fileCode = avformat_write_header(this->outFile, nullptr)) < 0)
             this->raiseError("Failed to write header", fileCode);
     }
@@ -160,6 +227,15 @@ public:
         fileCode = avformat_find_stream_info(this->inFile, 0);
         if (fileCode != 0)
             this->raiseError("Failed to open file", fileCode);
+
+        // Open separate input file for mergeStreams
+        this->mergeInFile = avformat_alloc_context();
+        fileCode = avformat_open_input(&this->mergeInFile, fileName.c_str(), nullptr, 0);
+        if (fileCode != 0)
+            this->raiseError("Failed to open merge input file", fileCode);
+        fileCode = avformat_find_stream_info(this->mergeInFile, 0);
+        if (fileCode != 0)
+            this->raiseError("Failed to open merge input file", fileCode);
 
         int codecCode;
         for (int i = 0; i < this->inFile->nb_streams; i++)
@@ -191,6 +267,7 @@ public:
     ~VideoFFmpeg()
     {
         avformat_close_input(&this->inFile);
+        avformat_close_input(&this->mergeInFile);
         avcodec_free_context(&this->decoder);
         avcodec_free_context(&this->encoder);
 
@@ -402,6 +479,13 @@ public:
         this->encoder->max_b_frames = 0;
         this->encoder->flags = 0;
 
+        AVCodecParameters *inputParams = this->inFile->streams[this->videoIndex]->codecpar;
+        this->encoder->color_range = inputParams->color_range;
+        this->encoder->color_primaries = inputParams->color_primaries;
+        this->encoder->color_trc = inputParams->color_trc;
+        this->encoder->colorspace = inputParams->color_space;
+        this->encoder->chroma_sample_location = inputParams->chroma_location;
+
         this->encoder->framerate = this->inFile->streams[this->videoIndex]->r_frame_rate;
 
         // fallback if framerate is invalid or sth
@@ -413,11 +497,11 @@ public:
         this->encoder->time_base = this->inFile->streams[this->videoIndex]->time_base;
 
         // sometimes timebase is not divisble by framerate, and becomes wrong
-        AVRational timebase = this->inFile->streams[this->videoIndex]->time_base;
-        AVRational framerate = this->encoder->framerate;
-        float ratioRounded = round((float)(timebase.den * framerate.den) / (float)(timebase.num * framerate.num));
-        int newTimebaseDen = (float)(ratioRounded * framerate.num * timebase.num) / (float)framerate.den;
-        this->encoder->time_base.den = newTimebaseDen;
+        // AVRational timebase = this->inFile->streams[this->videoIndex]->time_base;
+        // AVRational framerate = this->encoder->framerate;
+        // float ratioRounded = round((float)(timebase.den * framerate.den) / (float)(timebase.num * framerate.num));
+        // int newTimebaseDen = (float)(ratioRounded * framerate.num * timebase.num) / (float)framerate.den;
+        // this->encoder->time_base.den = newTimebaseDen;
 
         float fps = av_q2d(this->encoder->framerate);
 
@@ -452,19 +536,6 @@ public:
         unique_lock<mutex> lock(this->ebufferLocker);
         this->encoderInitialised = true;
         this->ebufferCV.notify_all();
-
-        printf("=== ENCODER CONFIG ===\n");
-        printf("width: %d, height: %d\n", encoder->width, encoder->height);
-        printf("pix_fmt: %d\n", encoder->pix_fmt);
-        printf("time_base: %d/%d\n", encoder->time_base.num, encoder->time_base.den);
-        printf("framerate: %d/%d\n", encoder->framerate.num, encoder->framerate.den);
-        printf("bit_rate: %lld\n", encoder->bit_rate);
-        printf("gop_size: %d\n", encoder->gop_size);
-        printf("max_b_frames: %d\n", encoder->max_b_frames);
-        printf("thread_count: %d\n", encoder->thread_count);
-        printf("thread_type: %d\n", encoder->thread_type);
-        printf("flags: %d\n", encoder->flags);
-        printf("===================\n");
     }
 
     void addEncodeFrames(AVFrame *frame)
@@ -478,10 +549,6 @@ public:
         // apply even for width and height
         if ((frame->width & ~1) != this->encoder->width || (frame->height & ~1) != this->encoder->height || frame->format != this->encoder->pix_fmt)
             this->raiseError("Frame doesn't match encoder");
-
-        // change frame width and height to even for compatibility
-        // frame->width &= ~1;
-        // frame->height &= ~1;
 
         unique_lock<mutex> lock(this->ebufferLocker);
 
@@ -508,10 +575,6 @@ public:
             if (!this->encoderInitialised)
                 this->raiseError("Encoder not initialised");
         }
-
-        // With time_base = 1/framerate, each frame increment is simply 1
-        // int64_t time_increment = 1;
-        // int64_t sequential_dts = 0;
 
         // this threshold measures how many elements in the buffer at minimum to pick out a frame and encode
         // the less frames there are, the more likely that the inordered frame as not arrived in the buffer yet
@@ -575,13 +638,9 @@ public:
                 while ((recvCode = avcodec_receive_packet(this->encoder, pkt)) == 0)
                 {
                     // getting a packet and processing it
-                    pkt->stream_index = outStream->index;
-                    // pkt->dts = sequential_dts;
-                    // pkt->pts = sequential_dts;
-                    // sequential_dts += time_increment;
-                    av_packet_rescale_ts(pkt, this->encoder->time_base, outStream->time_base);
-                    av_interleaved_write_frame(this->outFile, pkt);
-                    av_packet_unref(pkt);
+                    pkt->stream_index = outStreamsOrdered[this->videoIndex]->index;
+
+                    this->mergeStreams(pkt);
 
                     // try to send the packet again, if its successful, no need to get more packets
                     if ((codecCode = avcodec_send_frame(this->encoder, frame)) == 0)
@@ -634,13 +693,7 @@ public:
                     while ((recvCode = avcodec_receive_packet(this->encoder, pkt)) == 0)
                     {
                         // getting a packet and processing it
-                        pkt->stream_index = outStream->index;
-                        // pkt->dts = sequential_dts;
-                        // pkt->pts = sequential_dts;
-                        // sequential_dts += time_increment;
-                        av_packet_rescale_ts(pkt, this->encoder->time_base, outStream->time_base);
-                        av_interleaved_write_frame(this->outFile, pkt);
-                        av_packet_unref(pkt);
+                        this->mergeStreams(pkt);
 
                         // try to send the packet again, if its successful, no need to get more packets
                         if ((codecCode = avcodec_send_frame(this->encoder, frame)) == 0)
@@ -674,13 +727,9 @@ public:
         AVPacket *pkt = av_packet_alloc();
         while ((ret = avcodec_receive_packet(this->encoder, pkt)) == 0)
         {
-            pkt->stream_index = outStream->index;
-            // pkt->dts = sequential_dts;
-            // pkt->pts = sequential_dts;
-            // sequential_dts += time_increment;
-            av_packet_rescale_ts(pkt, this->encoder->time_base, outStream->time_base);
-            av_interleaved_write_frame(this->outFile, pkt);
-            av_packet_unref(pkt);
+            pkt->stream_index = this->outStreamsOrdered[this->videoIndex]->index;
+
+            this->mergeStreams(pkt);
         }
 
         av_packet_free(&pkt);
@@ -1016,7 +1065,7 @@ AVPixelFormat convertToYUV(AVPixelFormat format)
 
 int main(int argc, char *argv[])
 {
-    // av_log_set_level(AV_LOG_ERROR);
+    av_log_set_level(AV_LOG_DEBUG);
 
     // we need at least 3 threads total: producer, processor, consumer
     int threadCount = max(static_cast<int>(MAX_THREADS), 3);
