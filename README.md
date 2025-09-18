@@ -18,5 +18,5 @@
 
 -   [ ] threshold adapability _(low priority)_
 -   [ ] cli
--   [ ] cubic interpolation
+-   [x] cubic interpolation
 -   [ ] lanczos resampling

@@ -83,14 +83,16 @@ __global__ void columnTangent(const unsigned char *row_interpolated, float *outp
     if (row >= height || col >= scaled_width)
         return;
 
+    int interpolated_index = (row * scale * scaled_width) + col;
+
     // using catmull-rom
     float tangent;
     if (row == 0)
-        tangent = ((float)row_interpolated[global_idx + (scaled_width * scale)] - (float)row_interpolated[global_idx]) / 2.0;
+        tangent = ((float)row_interpolated[interpolated_index + (scaled_width * scale)] - (float)row_interpolated[interpolated_index]) / 2.0;
     else if (row == height - 1)
-        tangent = ((float)row_interpolated[global_idx] - (float)row_interpolated[global_idx - (scaled_width * scale)]) / 2.0;
+        tangent = ((float)row_interpolated[interpolated_index] - (float)row_interpolated[interpolated_index - (scaled_width * scale)]) / 2.0;
     else
-        tangent = ((float)row_interpolated[global_idx + (scaled_width * scale)] - (float)row_interpolated[global_idx - (scaled_width * scale)]) / 2.0;
+        tangent = ((float)row_interpolated[interpolated_index + (scaled_width * scale)] - (float)row_interpolated[interpolated_index - (scaled_width * scale)]) / 2.0;
 
     output[global_idx] = tangent;
 }
@@ -336,45 +338,41 @@ void bicubicInterpolation(AVFrame **frame, int scale, hipStream_t &stream, GPUMe
     int rowThreadCountChroma = chromaWidth * chromaHeight;
     int rowBlocksChroma = ceil((float)rowThreadCountChroma / (float)threadsPerBlock);
 
-    void *rowTangentArgsY[] = {&memory[BicubicGPUMemory::Y_PLANE], &memory[BicubicTangentGPUMemory::Y_ROW_TANGENTS], &width, &height};
-    void *rowTangentArgsU[] = {&memory[BicubicGPUMemory::U_PLANE], &memory[BicubicTangentGPUMemory::U_ROW_TANGENTS], &chromaWidth, &chromaHeight};
-    void *rowTangentArgsV[] = {&memory[BicubicGPUMemory::V_PLANE], &memory[BicubicTangentGPUMemory::V_ROW_TANGENTS], &chromaWidth, &chromaHeight};
+    void *rowTangentArgsY[] = {&memory[BicubicGPUMemory::Y_PLANE], &tangentMemory[BicubicTangentGPUMemory::Y_ROW_TANGENTS], &width, &height};
+    void *rowTangentArgsU[] = {&memory[BicubicGPUMemory::U_PLANE], &tangentMemory[BicubicTangentGPUMemory::U_ROW_TANGENTS], &chromaWidth, &chromaHeight};
+    void *rowTangentArgsV[] = {&memory[BicubicGPUMemory::V_PLANE], &tangentMemory[BicubicTangentGPUMemory::V_ROW_TANGENTS], &chromaWidth, &chromaHeight};
 
     HIP_CHECK(hipLaunchKernel((const void *)rowTangent, dim3(rowBlocksY), dim3(threadsPerBlock), rowTangentArgsY, 0, stream));
     HIP_CHECK(hipLaunchKernel((const void *)rowTangent, dim3(rowBlocksChroma), dim3(threadsPerBlock), rowTangentArgsU, 0, stream));
     HIP_CHECK(hipLaunchKernel((const void *)rowTangent, dim3(rowBlocksChroma), dim3(threadsPerBlock), rowTangentArgsV, 0, stream));
 
-    void *rowInterpolateArgsY[] = {&memory[BicubicGPUMemory::Y_PLANE], &memory[BicubicTangentGPUMemory::Y_ROW_TANGENTS], &memory[BicubicGPUMemory::OUTPUT_Y_PLANE], &width, &height, &scale};
-    void *rowInterpolateArgsU[] = {&memory[BicubicGPUMemory::U_PLANE], &memory[BicubicTangentGPUMemory::U_ROW_TANGENTS], &memory[BicubicGPUMemory::OUTPUT_U_PLANE], &chromaWidth, &chromaHeight, &scale};
-    void *rowInterpolateArgsV[] = {&memory[BicubicGPUMemory::V_PLANE], &memory[BicubicTangentGPUMemory::V_ROW_TANGENTS], &memory[BicubicGPUMemory::OUTPUT_V_PLANE], &chromaWidth, &chromaHeight, &scale};
+    void *rowInterpolateArgsY[] = {&memory[BicubicGPUMemory::Y_PLANE], &tangentMemory[BicubicTangentGPUMemory::Y_ROW_TANGENTS], &memory[BicubicGPUMemory::OUTPUT_Y_PLANE], &width, &height, &scale};
+    void *rowInterpolateArgsU[] = {&memory[BicubicGPUMemory::U_PLANE], &tangentMemory[BicubicTangentGPUMemory::U_ROW_TANGENTS], &memory[BicubicGPUMemory::OUTPUT_U_PLANE], &chromaWidth, &chromaHeight, &scale};
+    void *rowInterpolateArgsV[] = {&memory[BicubicGPUMemory::V_PLANE], &tangentMemory[BicubicTangentGPUMemory::V_ROW_TANGENTS], &memory[BicubicGPUMemory::OUTPUT_V_PLANE], &chromaWidth, &chromaHeight, &scale};
 
     HIP_CHECK(hipStreamSynchronize(stream));
     HIP_CHECK(hipLaunchKernel((const void *)cubicRowInterpolate, dim3(rowBlocksY), dim3(threadsPerBlock), rowInterpolateArgsY, 0, stream));
     HIP_CHECK(hipLaunchKernel((const void *)cubicRowInterpolate, dim3(rowBlocksChroma), dim3(threadsPerBlock), rowInterpolateArgsU, 0, stream));
     HIP_CHECK(hipLaunchKernel((const void *)cubicRowInterpolate, dim3(rowBlocksChroma), dim3(threadsPerBlock), rowInterpolateArgsV, 0, stream));
 
-    int colThreadCountY = scaledWidth * (height - 1);
+    int colThreadCountY = scaledWidth * height;
     int colBlocksY = ceil((float)colThreadCountY / (float)threadsPerBlock);
 
     int colThreadCountChroma = scaledChromaWidth * (chromaHeight - 1);
     int colBlocksChroma = ceil((float)colThreadCountChroma / (float)threadsPerBlock);
 
-    void *colTangentArgsY[] = {&memory[BicubicGPUMemory::OUTPUT_Y_PLANE], &memory[BicubicTangentGPUMemory::Y_COL_TANGENTS], &scaledWidth, &height, &scale};
-    void *colTangentArgsU[] = {&memory[BicubicGPUMemory::OUTPUT_U_PLANE], &memory[BicubicTangentGPUMemory::U_COL_TANGENTS], &scaledChromaWidth, &chromaHeight, &scale};
-    void *colTangentArgsV[] = {&memory[BicubicGPUMemory::OUTPUT_V_PLANE], &memory[BicubicTangentGPUMemory::V_COL_TANGENTS], &scaledChromaWidth, &chromaHeight, &scale};
+    void *colTangentArgsY[] = {&memory[BicubicGPUMemory::OUTPUT_Y_PLANE], &tangentMemory[BicubicTangentGPUMemory::Y_COL_TANGENTS], &scaledWidth, &height, &scale};
+    void *colTangentArgsU[] = {&memory[BicubicGPUMemory::OUTPUT_U_PLANE], &tangentMemory[BicubicTangentGPUMemory::U_COL_TANGENTS], &scaledChromaWidth, &chromaHeight, &scale};
+    void *colTangentArgsV[] = {&memory[BicubicGPUMemory::OUTPUT_V_PLANE], &tangentMemory[BicubicTangentGPUMemory::V_COL_TANGENTS], &scaledChromaWidth, &chromaHeight, &scale};
 
     HIP_CHECK(hipStreamSynchronize(stream));
     HIP_CHECK(hipLaunchKernel((const void *)columnTangent, dim3(colBlocksY), dim3(threadsPerBlock), colTangentArgsY, 0, stream));
     HIP_CHECK(hipLaunchKernel((const void *)columnTangent, dim3(colBlocksChroma), dim3(threadsPerBlock), colTangentArgsU, 0, stream));
     HIP_CHECK(hipLaunchKernel((const void *)columnTangent, dim3(colBlocksChroma), dim3(threadsPerBlock), colTangentArgsV, 0, stream));
 
-    // NOTE: row_rec_tangents is the output from columnTangent, so its size is (scaled_width * height)
-    // NOTE: DO NOT SPAWN THREADS FOR THE LAST ROW, there IS check for last row but its less efficient
-    // __global__ void cubicColumnInterpolate(unsigned char *row_interpolated, const float *row_rec_tangents, const int scaled_width, const int scaled_height, const int scale)
-
-    void *colInterpolateArgsY[] = {&memory[BicubicGPUMemory::OUTPUT_Y_PLANE], &memory[BicubicTangentGPUMemory::Y_COL_TANGENTS], &scaledWidth, &scaledHeight, &scale};
-    void *colInterpolateArgsU[] = {&memory[BicubicGPUMemory::OUTPUT_U_PLANE], &memory[BicubicTangentGPUMemory::U_COL_TANGENTS], &scaledChromaWidth, &scaledChromaHeight, &scale};
-    void *colInterpolateArgsV[] = {&memory[BicubicGPUMemory::OUTPUT_V_PLANE], &memory[BicubicTangentGPUMemory::V_COL_TANGENTS], &scaledChromaWidth, &scaledChromaHeight, &scale};
+    void *colInterpolateArgsY[] = {&memory[BicubicGPUMemory::OUTPUT_Y_PLANE], &tangentMemory[BicubicTangentGPUMemory::Y_COL_TANGENTS], &scaledWidth, &scaledHeight, &scale};
+    void *colInterpolateArgsU[] = {&memory[BicubicGPUMemory::OUTPUT_U_PLANE], &tangentMemory[BicubicTangentGPUMemory::U_COL_TANGENTS], &scaledChromaWidth, &scaledChromaHeight, &scale};
+    void *colInterpolateArgsV[] = {&memory[BicubicGPUMemory::OUTPUT_V_PLANE], &tangentMemory[BicubicTangentGPUMemory::V_COL_TANGENTS], &scaledChromaWidth, &scaledChromaHeight, &scale};
 
     HIP_CHECK(hipStreamSynchronize(stream));
     HIP_CHECK(hipLaunchKernel((const void *)cubicColumnInterpolate, dim3(colBlocksY), dim3(threadsPerBlock), colInterpolateArgsY, 0, stream));
