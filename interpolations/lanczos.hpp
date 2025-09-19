@@ -47,8 +47,8 @@ __global__ void lanczosRowInterpolation(const unsigned char *plane, const float 
     // loop for copying values + calculating first interpolation
     for (int i = 0; i < window; i++)
     {
-        // for this forloop, the range of index would be (global_idx - a - 1) to (global_idx + a) inclusive
-        int value_index = fminf(fmaxf(global_idx - a - 1 + i, row_min_index), row_max_index);
+        // for this forloop, the range of index would be (global_idx - a + 1) to (global_idx + a) inclusive
+        int value_index = fminf(fmaxf(global_idx - a + 1 + i, row_min_index), row_max_index);
         values[i] = plane[value_index];
 
         // local kernel for the first interpolation value is from index 0 to window-1
@@ -67,6 +67,68 @@ __global__ void lanczosRowInterpolation(const unsigned char *plane, const float 
             interpolated += (float)values[i] * local_kernel[i + kernel_index_offset];
 
         output[output_index + x] = (unsigned char)fminf(fmaxf(interpolated, 0.0f), 255.0f);
+    }
+}
+
+__global__ void lanczosColumnInterpolation(unsigned char *row_interpolated, const float *lanczos_kernel, const int scaled_width, const int scaled_height, const int scale, const int window)
+{
+    int thread_idx = threadIdx.x;
+    int global_idx = threadIdx.x + blockIdx.x * blockDim.x;
+
+    int scaled_row = (global_idx / scaled_width) * scale; // which row we're in
+    int col = global_idx % scaled_width;                  // which column in that row
+
+    // check bounds
+    if (scaled_row >= scaled_height - (scale - 1) || col >= scaled_width)
+        return;
+
+    assert((scale - 1) * window > blockDim.x);
+
+    __shared__ float local_kernel[(scale - 1) * window];
+
+    if (thread_idx < (scale - 1) * window)
+        local_kernel[thread_idx] = lanczos_kernel[thread_idx];
+
+    __syncthreads();
+
+    // Starting position in output buffer
+    int start_index = (scaled_row * scaled_width) + col;
+
+    unsigned char values[window];
+    int a = window / 2;
+
+    int col_min_index = col;
+    // total index - space between current column to last column - (scale-1) cropped columns
+    int col_max_index = (scaled_width * scaled_height - 1) - (scaled_width - 1 - col) - (scaled_width * (scale - 1));
+
+    float interpolated = 0;
+
+    // for efficiency, we will start calculating for the first interpolation value with the loop that copies the values in
+    float interpolated = 0;
+    // loop for copying values + calculating first interpolation
+    for (int i = 0; i < window; i++)
+    {
+        // first index should be ((-a+1) * scale) columns from current column
+        // then next interations should be (-a + 1 + i) * scale columns back
+        int value_index = fminf(fmaxf(global_idx + (((-a + 1 + i) * scale) * scaled_width), col_min_index), col_max_index);
+        values[i] = row_interpolated[value_index];
+
+        // local kernel for the first interpolation value is from index 0 to window-1
+        interpolated += (float)values[i] * local_kernel[i];
+    }
+
+    row_interpolated[start_index + (1 * scaled_width)] = (unsigned char)fminf(fmaxf(interpolated, 0.0f), 255.0f);
+
+    // first interpolation already done, so do for the rest
+    for (int x = 2; x < scale; x++)
+    {
+        interpolated = 0;
+        int kernel_index_offset = (x - 1) * window;
+
+        for (int i = 0; i < window; i++)
+            interpolated += (float)values[i] * local_kernel[i + kernel_index_offset];
+
+        row_interpolated[start_index + (x * scaled_width)] = (unsigned char)fminf(fmaxf(interpolated, 0.0f), 255.0f);
     }
 }
 
