@@ -119,7 +119,7 @@ __global__ void cubicColumnInterpolate(unsigned char *row_interpolated, const fl
     int col = global_idx % scaled_width;                  // which column in that row
 
     // check bounds
-    if (scaled_row >= scaled_height || col >= scaled_width)
+    if (scaled_row >= scaled_height - (scale - 1) || col >= scaled_width)
         return;
 
     int row = global_idx / scaled_width;

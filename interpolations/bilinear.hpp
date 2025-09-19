@@ -63,7 +63,7 @@ __global__ void linearColumnInterpolate(unsigned char *row_interpolated, const i
     int col = global_idx % scaled_width;           // which column in that row
 
     // check bounds
-    if (row >= scaled_height || col >= scaled_width)
+    if (row >= scaled_height - (scale - 1) || col >= scaled_width)
         return;
 
     // Starting position in output buffer
