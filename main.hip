@@ -853,7 +853,7 @@ int main(int argc, char *argv[])
     // settings
     int processorCount = 1;
     float thresholdLevel = 0.75;
-    int scale = 5;
+    int scale = 6;
     const char *input = "input.mov";
     const char *output = "output.mov";
 
@@ -865,8 +865,8 @@ int main(int argc, char *argv[])
     AVPixelFormat format = convertToYUV(video.getPixelFormat());
 
     pair<int, int> dimension = video.getDimension();
-    int scaledWidth = (dimension.first - 1) * scale + 1;
-    int scaledHeight = (dimension.second - 1) * scale + 1;
+    int scaledWidth = dimension.first * scale;
+    int scaledHeight = dimension.second * scale;
     video.initialiseEncoder(scaledWidth, scaledHeight, format);
 
     int threadCount = min(usableThreads, processorCount + 2); // +2 because one for consumer one for producer

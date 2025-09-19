@@ -38,7 +38,7 @@ __global__ void cubicRowInterpolate(const unsigned char *plane, const float *tan
         return;
 
     // Starting position in output buffer
-    int output_width = ((width - 1) * scale) + 1;
+    int output_width = width * scale;
     int output_row = row * scale;
     int output_col = col * scale;
     int output_index = (output_row * output_width) + output_col;
@@ -48,12 +48,24 @@ __global__ void cubicRowInterpolate(const unsigned char *plane, const float *tan
     // Set the original pixel in output
     output[output_index] = start;
 
+    unsigned char end;
+    float end_tangent;
+    int offset = 0;
     // if its the last of width, it cant interpolate to the right, so no need
     if (col == width - 1)
-        return;
-
-    unsigned char end = plane[global_idx + 1];
-    float end_tangent = tangents[global_idx + 1];
+    {
+        // we are going to use the previous values to the current value
+        end = start;
+        end_tangent = start_tangent;
+        start = plane[global_idx - 1];
+        start_tangent = tangents[global_idx - 1];
+        offset = 1; // only 1 because the original domain is 0 to 1, so now we need to be 1 to 2
+    }
+    else
+    {
+        end = plane[global_idx + 1];
+        end_tangent = tangents[global_idx + 1];
+    }
 
     float rank3Coeff = (2 * start) + start_tangent - (2 * end) + end_tangent;
     float rank2Coeff = (-3 * start + 3 * end - 2 * start_tangent - end_tangent);
@@ -62,7 +74,7 @@ __global__ void cubicRowInterpolate(const unsigned char *plane, const float *tan
 
     for (int i = 1; i < scale; i++)
     {
-        float t = (float)i / (float)(scale - 1);
+        float t = (float)(i + offset) / (float)(scale - 1);
         // float interpolated = rank3Coeff * (t * t * t) + rank2Coeff * (t * t) + rank1Coeff * t + rank0Coeff;
         float interpolated = ((rank3Coeff * t + rank2Coeff) * t + rank1Coeff) * t + rank0Coeff; // more efficient
         float clamped = fminf(fmaxf(interpolated, 0.0f), 255.0f);
@@ -110,10 +122,6 @@ __global__ void cubicColumnInterpolate(unsigned char *row_interpolated, const fl
     if (scaled_row >= scaled_height || col >= scaled_width)
         return;
 
-    // skip last row
-    if (scaled_row == scaled_height - 1)
-        return;
-
     int row = global_idx / scaled_width;
 
     // starting position in output buffer by rows
@@ -125,8 +133,23 @@ __global__ void cubicColumnInterpolate(unsigned char *row_interpolated, const fl
     unsigned char start = row_interpolated[output_index];
     float start_tangent = row_rec_tangents[tangent_index];
 
-    unsigned char end = row_interpolated[output_index + (scaled_width * scale)]; // we are skipping (scale-1) rows to the next available row, the ones in between are the ones to interpolate
-    float end_tangent = row_rec_tangents[tangent_index + scaled_width];
+    unsigned char end; // we are skipping (scale-1) rows to the next available row, the ones in between are the ones to interpolate
+    float end_tangent;
+    int offset = 0;
+
+    if (scaled_row == scaled_height - scale)
+    {
+        end = start;
+        end_tangent = start_tangent;
+        start = row_interpolated[output_index - (scaled_width * scale)];
+        start_tangent = row_rec_tangents[tangent_index - scaled_width];
+        offset = 1;
+    }
+    else
+    {
+        end = row_interpolated[output_index + (scaled_width * scale)];
+        end_tangent = row_rec_tangents[tangent_index + scaled_width];
+    }
 
     float rank3Coeff = (2 * start) + start_tangent - (2 * end) + end_tangent;
     float rank2Coeff = (-3 * start + 3 * end - 2 * start_tangent - end_tangent);
@@ -135,7 +158,7 @@ __global__ void cubicColumnInterpolate(unsigned char *row_interpolated, const fl
 
     for (int i = 1; i < scale; i++)
     {
-        float t = (float)i / (float)(scale - 1);
+        float t = (float)(i + offset) / (float)(scale - 1);
         // float interpolated = rank3Coeff * (t * t * t) + rank2Coeff * (t * t) + rank1Coeff * t + rank0Coeff;
         float interpolated = ((rank3Coeff * t + rank2Coeff) * t + rank1Coeff) * t + rank0Coeff; // more efficient
         float clamped = fminf(fmaxf(interpolated, 0.0f), 255.0f);
@@ -154,8 +177,8 @@ public:
 
         // only index that has a "next" row or column can interpolate, so the last col of any row, and last row of any col will be a straight map
         // a -1 because width and height is overlapping the very last index
-        int newWidth = ((width - 1) * scale) + 1;
-        int newHeight = ((height - 1) * scale) + 1;
+        int newWidth = width * scale;
+        int newHeight = height * scale;
         int newPlaneSize = newWidth * newHeight;
 
         // get chroma width and height
@@ -166,8 +189,8 @@ public:
         int chromaPlaneSize = chromaHeight * chromaWidth;
 
         // same idea here
-        int newChromaWidth = ((chromaWidth - 1) * scale) + 1;
-        int newChromaHeight = ((chromaHeight - 1) * scale) + 1;
+        int newChromaWidth = chromaWidth * scale;
+        int newChromaHeight = chromaHeight * scale;
         int newChromaPlaneSize = newChromaWidth * newChromaHeight;
 
         this->allocate({// Y Plane
@@ -210,8 +233,8 @@ public:
 
         // only index that has a "next" row or column can interpolate, so the last col of any row, and last row of any col will be a straight map
         // a -1 because width and height is overlapping the very last index
-        int newWidth = ((width - 1) * scale) + 1;
-        int newHeight = ((height - 1) * scale) + 1;
+        int newWidth = width * scale;
+        int newHeight = height * scale;
         int newPlaneSize = newWidth * newHeight;
 
         int colTangentSize = newWidth * height;
@@ -224,8 +247,8 @@ public:
         int chromaPlaneSize = chromaHeight * chromaWidth;
 
         // same idea here
-        int newChromaWidth = ((chromaWidth - 1) * scale) + 1;
-        int newChromaHeight = ((chromaHeight - 1) * scale) + 1;
+        int newChromaWidth = chromaWidth * scale;
+        int newChromaHeight = chromaHeight * scale;
         int newChromaPlaneSize = newChromaWidth * newChromaHeight;
 
         int chromaColTangentSize = newChromaWidth * chromaHeight;
@@ -277,8 +300,8 @@ void bicubicInterpolation(AVFrame **frame, int scale, hipStream_t &stream, GPUMe
 
     // only index that has a "next" row or column can interpolate, so the last col of any row, and last row of any col will be a straight map
     // a -1 because width and height is overlapping the very last index
-    int scaledWidth = ((width - 1) * scale) + 1;
-    int scaledHeight = ((height - 1) * scale) + 1;
+    int scaledWidth = width * scale;
+    int scaledHeight = height * scale;
     int scaledPlaneSize = scaledWidth * scaledHeight;
 
     int colTangentSize = scaledWidth * height;
@@ -291,8 +314,8 @@ void bicubicInterpolation(AVFrame **frame, int scale, hipStream_t &stream, GPUMe
     int chromaPlaneSize = chromaHeight * chromaWidth;
 
     // same idea here
-    int scaledChromaWidth = ((chromaWidth - 1) * scale) + 1;
-    int scaledChromaHeight = ((chromaHeight - 1) * scale) + 1;
+    int scaledChromaWidth = chromaWidth * scale;
+    int scaledChromaHeight = chromaHeight * scale;
     int scaledChromaPlaneSize = scaledChromaWidth * scaledChromaHeight;
 
     int chromaColTangentSize = scaledChromaWidth * chromaHeight;
@@ -358,7 +381,7 @@ void bicubicInterpolation(AVFrame **frame, int scale, hipStream_t &stream, GPUMe
     int colThreadCountY = scaledWidth * height;
     int colBlocksY = ceil((float)colThreadCountY / (float)threadsPerBlock);
 
-    int colThreadCountChroma = scaledChromaWidth * (chromaHeight - 1);
+    int colThreadCountChroma = scaledChromaWidth * chromaHeight;
     int colBlocksChroma = ceil((float)colThreadCountChroma / (float)threadsPerBlock);
 
     void *colTangentArgsY[] = {&memory[BicubicGPUMemory::OUTPUT_Y_PLANE], &tangentMemory[BicubicTangentGPUMemory::Y_COL_TANGENTS], &scaledWidth, &height, &scale};

@@ -14,11 +14,8 @@ __global__ void linearRowInterpolate(const unsigned char *plane, unsigned char *
     if (row >= height || col >= width)
         return;
 
-    // Calculate output linesize (scaled width)
-    // int output_linesize = width * scale;
-
     // Starting position in output buffer
-    int output_width = ((width - 1) * scale) + 1;
+    int output_width = width * scale;
     int output_row = row * scale;
     int output_col = col * scale;
     int output_index = (output_row * output_width) + output_col;
@@ -30,24 +27,34 @@ __global__ void linearRowInterpolate(const unsigned char *plane, unsigned char *
 
     // if its the last pixel from width, it doesnt have a next pixel to interpolate from
     // but we still need to place it in the output, which we already did above
-    if (col == width - 1)
-        return;
 
-    unsigned char end = plane[global_idx + 1];
+    unsigned char end;
+    int offset = 0;
+
+    // for the last in the row, we continue from the previous gradient
+    // to do this, we use the start and end of the previous value, not the next
+    if (col == width - 1)
+    {
+        end = start;
+        start = plane[global_idx - 1];
+        offset = scale;
+    }
+    else
+        // use the gradient of this index and the next
+        end = plane[global_idx + 1];
 
     // gradient = change per step = (end - start) / scale
     float gradient = (float)(end - start) / (float)scale;
 
     for (int i = 1; i < scale; i++)
     {
-        unsigned char interpolated = start + (unsigned char)(i * gradient);
-        output[output_index + i] = interpolated;
+        float interpolated = start + (i + offset) * gradient;
+        float clamped = fminf(fmaxf(interpolated, 0.0f), 255.0f);
+        output[output_index + i] = (unsigned char)clamped;
     }
 }
 
-// TODO: make sure to give NO THREADS for the final row, there IS a check but its less efficient
-// TODO: so we are passing one thread for all valued element in the rowInterpolated frame EXCEPT the final row
-// TODO: also PASS THE SAME ROW INTERPOLATED FRAME, it will be modified on top
+// PASS THE SAME ROW INTERPOLATED FRAME, it will be modified on top
 __global__ void linearColumnInterpolate(unsigned char *row_interpolated, const int scaled_width, const int scaled_height, const int scale)
 {
     int global_idx = threadIdx.x + blockIdx.x * blockDim.x;
@@ -59,23 +66,31 @@ __global__ void linearColumnInterpolate(unsigned char *row_interpolated, const i
     if (row >= scaled_height || col >= scaled_width)
         return;
 
-    // skipping last row, just in case
-    if (row == scaled_height - 1)
-        return;
-
     // Starting position in output buffer
     int start_index = (row * scaled_width) + col;
 
     unsigned char start = row_interpolated[start_index];
-    unsigned char end = row_interpolated[start_index + (scale * scaled_width)]; // we are skipping (scale-1) rows
+    unsigned char end; // we are skipping (scale-1) rows
+    int offset = 0;
+
+    // if the last value in the column, use the previous gradient
+    if (row == scaled_height - scale)
+    {
+        end = start;
+        start = row_interpolated[start_index - (scale * scaled_width)];
+        offset = scale; // original domain is 0 to scale, now it needs to be scale to 2*scale
+    }
+    else
+        end = row_interpolated[start_index + (scale * scaled_width)];
 
     // gradient = change per step = (end - start) / scale
     float gradient = (float)(end - start) / (float)scale;
 
     for (int i = 1; i < scale; i++)
     {
-        unsigned char interpolated = start + (unsigned char)(i * gradient);
-        row_interpolated[start_index + (i * scaled_width)] = interpolated;
+        float interpolated = start + (i + offset) * gradient;
+        float clamped = fminf(fmaxf(interpolated, 0.0f), 255.0f);
+        row_interpolated[start_index + (i * scaled_width)] = (unsigned char)clamped;
     }
 }
 
@@ -97,24 +112,24 @@ public:
 
         // only index that has a "next" row or column can interpolate, so the last col of any row, and last row of any col will be a straight map
         // a -1 because width and height is overlapping the very last index
-        int scaledWidth = ((width - 1) * scale) + 1;
-        int scaledHeight = ((height - 1) * scale) + 1;
+        int scaledWidth = width * scale;
+        int scaledHeight = height * scale;
         int scaledPlaneSize = scaledWidth * scaledHeight;
         // same idea here
-        int scaledChromaWidth = ((chromaWidth - 1) * scale) + 1;
-        int scaledChromaHeight = ((chromaHeight - 1) * scale) + 1;
+        int scaledChromaWidth = chromaWidth * scale;
+        int scaledChromaHeight = chromaHeight * scale;
         int scaledChromaPlaneSize = scaledChromaWidth * scaledChromaHeight;
 
-        this->allocate({planeSize, chromaPlaneSize, chromaPlaneSize, scaledPlaneSize, scaledChromaPlaneSize, scaledChromaPlaneSize});
+        this->allocate({planeSize, scaledPlaneSize, chromaPlaneSize, scaledChromaPlaneSize, chromaPlaneSize, scaledChromaPlaneSize});
     }
 
     enum MemoryPosition
     {
         Y_PLANE,
-        U_PLANE,
-        V_PLANE,
         OUTPUT_Y_PLANE,
+        U_PLANE,
         OUTPUT_U_PLANE,
+        V_PLANE,
         OUTPUT_V_PLANE,
     };
 
@@ -141,15 +156,15 @@ void bilinearInterpolation(AVFrame **frame, int scale, hipStream_t &stream, GPUM
 
     // only index that has a "next" row or column can interpolate, so the last col of any row, and last row of any col will be a straight map
     // a -1 because width and height is overlapping the very last index
-    int newWidth = ((width - 1) * scale) + 1;
-    int newHeight = ((height - 1) * scale) + 1;
-    int newPlaneSize = newWidth * newHeight;
+    int scaledWidth = width * scale;
+    int scaledHeight = height * scale;
+    int scaledPlaneSize = scaledWidth * scaledHeight;
     // same idea here
-    int newChromaWidth = ((chromaWidth - 1) * scale) + 1;
-    int newChromaHeight = ((chromaHeight - 1) * scale) + 1;
-    int newChromaPlaneSize = newChromaWidth * newChromaHeight;
+    int scaledChromaWidth = chromaWidth * scale;
+    int scaledChromaHeight = chromaHeight * scale;
+    int scaledChromaPlaneSize = scaledChromaWidth * scaledChromaHeight;
 
-    memory.validateMemorySizes({planeSize, chromaPlaneSize, chromaPlaneSize, newPlaneSize, newChromaPlaneSize, newChromaPlaneSize});
+    memory.validateMemorySizes({planeSize, scaledPlaneSize, chromaPlaneSize, scaledChromaPlaneSize, chromaPlaneSize, scaledChromaPlaneSize});
 
     uint8_t *YPlane = (*frame)->data[0];
     uint8_t *UPlane = (*frame)->data[1];
@@ -181,17 +196,17 @@ void bilinearInterpolation(AVFrame **frame, int scale, hipStream_t &stream, GPUM
     HIP_CHECK(hipLaunchKernel((const void *)linearRowInterpolate, dim3(rowNumBlocksU), dim3(threadsPerBlock), rowArgsU, 0, stream));
     HIP_CHECK(hipLaunchKernel((const void *)linearRowInterpolate, dim3(rowNumBlocksV), dim3(threadsPerBlock), rowArgsV, 0, stream));
 
-    int colThreadCountY = newWidth * (height - 1);
+    int colThreadCountY = scaledWidth * height;
     int colNumBlocksY = ceil((float)colThreadCountY / (float)threadsPerBlock);
-    void *colArgsY[] = {&memory[BilinearGPUMemory::OUTPUT_Y_PLANE], &newWidth, &newHeight, &scale};
+    void *colArgsY[] = {&memory[BilinearGPUMemory::OUTPUT_Y_PLANE], &scaledWidth, &scaledHeight, &scale};
 
-    int colThreadCountU = newChromaWidth * (chromaHeight - 1);
+    int colThreadCountU = scaledChromaWidth * chromaHeight;
     int colNumBlocksU = ceil((float)colThreadCountU / (float)threadsPerBlock);
-    void *colArgsU[] = {&memory[BilinearGPUMemory::OUTPUT_U_PLANE], &newChromaWidth, &newChromaHeight, &scale};
+    void *colArgsU[] = {&memory[BilinearGPUMemory::OUTPUT_U_PLANE], &scaledChromaWidth, &scaledChromaHeight, &scale};
 
-    int colThreadCountV = newChromaWidth * (chromaHeight - 1);
+    int colThreadCountV = scaledChromaWidth * chromaHeight;
     int colNumBlocksV = ceil((float)colThreadCountV / (float)threadsPerBlock);
-    void *colArgsV[] = {&memory[BilinearGPUMemory::OUTPUT_V_PLANE], &newChromaWidth, &newChromaHeight, &scale};
+    void *colArgsV[] = {&memory[BilinearGPUMemory::OUTPUT_V_PLANE], &scaledChromaWidth, &scaledChromaHeight, &scale};
 
     HIP_CHECK(hipStreamSynchronize(stream));
     HIP_CHECK(hipLaunchKernel((const void *)linearColumnInterpolate, dim3(colNumBlocksY), dim3(threadsPerBlock), colArgsY, 0, stream));
@@ -200,15 +215,15 @@ void bilinearInterpolation(AVFrame **frame, int scale, hipStream_t &stream, GPUM
 
     AVFrame *newFrame = av_frame_alloc();
     av_frame_copy_props(newFrame, *frame);
-    newFrame->width = newWidth;
-    newFrame->height = newHeight;
+    newFrame->width = scaledWidth;
+    newFrame->height = scaledHeight;
     newFrame->format = (*frame)->format;
     av_frame_get_buffer(newFrame, 0);
 
     HIP_CHECK(hipStreamSynchronize(stream));
-    HIP_CHECK(hipMemcpy2D(newFrame->data[0], newFrame->linesize[0], memory[BilinearGPUMemory::OUTPUT_Y_PLANE], newWidth * sizeof(uint8_t), newWidth * sizeof(uint8_t), newHeight, hipMemcpyDeviceToHost));
-    HIP_CHECK(hipMemcpy2D(newFrame->data[1], newFrame->linesize[1], memory[BilinearGPUMemory::OUTPUT_U_PLANE], newChromaWidth * sizeof(uint8_t), newChromaWidth * sizeof(uint8_t), newChromaHeight, hipMemcpyDeviceToHost));
-    HIP_CHECK(hipMemcpy2D(newFrame->data[2], newFrame->linesize[2], memory[BilinearGPUMemory::OUTPUT_V_PLANE], newChromaWidth * sizeof(uint8_t), newChromaWidth * sizeof(uint8_t), newChromaHeight, hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy2D(newFrame->data[0], newFrame->linesize[0], memory[BilinearGPUMemory::OUTPUT_Y_PLANE], scaledWidth * sizeof(uint8_t), scaledWidth * sizeof(uint8_t), scaledHeight, hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy2D(newFrame->data[1], newFrame->linesize[1], memory[BilinearGPUMemory::OUTPUT_U_PLANE], scaledChromaWidth * sizeof(uint8_t), scaledChromaWidth * sizeof(uint8_t), scaledChromaHeight, hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy2D(newFrame->data[2], newFrame->linesize[2], memory[BilinearGPUMemory::OUTPUT_V_PLANE], scaledChromaWidth * sizeof(uint8_t), scaledChromaWidth * sizeof(uint8_t), scaledChromaHeight, hipMemcpyDeviceToHost));
 
     av_frame_free(frame);
     *frame = newFrame;
