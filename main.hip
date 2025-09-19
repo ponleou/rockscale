@@ -8,6 +8,7 @@ extern "C"
 
 #include "interpolations/bilinear.hpp"
 #include "interpolations/bicubic.hpp"
+#include "interpolations/lanczos.hpp"
 
 #include <mutex>
 #include <string>
@@ -23,7 +24,6 @@ extern "C"
 using std::function;
 using std::thread;
 using namespace std::chrono;
-using std::array;
 using std::cerr;
 using std::condition_variable;
 using std::cout;
@@ -797,13 +797,22 @@ void processor(VideoFFmpeg &video, int scale, AVPixelFormat format)
     HIP_CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
 
     BilinearGPUMemory bilinearMemory(frame, scale);
+
     BicubicGPUMemory bicubicMemory(frame, scale);
     BicubicTangentGPUMemory bicubicTangent(frame, scale);
+
+    int halfWindow = 5;
+
+    LanczosGPUMemory lanczosMemory(frame, scale);
+    LanczosKernelGPUMemory lanczosKernel(scale, halfWindow);
+    LanczosKernel kernel(scale, halfWindow);
 
     do
     {
         // bilinearInterpolation(&frame, scale, stream, bilinearMemory);
-        bicubicInterpolation(&frame, scale, stream, bicubicMemory, bicubicTangent);
+        // bicubicInterpolation(&frame, scale, stream, bicubicMemory, bicubicTangent);
+        lanczosInterpolation(&frame, scale, halfWindow, kernel, stream, lanczosMemory, lanczosKernel);
+
         video.addEncodeFrames(frame);
 
         frame = video.getFrame(format);

@@ -23,7 +23,6 @@ using std::to_string;
 #define blockIdx (dim3{})
 #define blockDim (dim3{})
 #define __syncthreads()
-#define assert(condition)
 #endif
 
 #define HIP_CHECK(expression)                 \
@@ -81,7 +80,7 @@ public:
         }
     }
 
-    T *&operator[](int index)
+    virtual T *&operator[](int index)
     {
         return this->memory[index];
     }
