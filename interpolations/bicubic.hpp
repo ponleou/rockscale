@@ -74,7 +74,7 @@ __global__ void cubicRowInterpolate(const unsigned char *plane, const float *tan
 
     for (int i = 1; i < scale; i++)
     {
-        float t = (float)(i + offset) / (float)(scale - 1);
+        float t = (float)(i + offset) / (float)scale;
         // float interpolated = rank3Coeff * (t * t * t) + rank2Coeff * (t * t) + rank1Coeff * t + rank0Coeff;
         float interpolated = ((rank3Coeff * t + rank2Coeff) * t + rank1Coeff) * t + rank0Coeff; // more efficient
         float clamped = fminf(fmaxf(interpolated, 0.0f), 255.0f);
@@ -158,7 +158,7 @@ __global__ void cubicColumnInterpolate(unsigned char *row_interpolated, const fl
 
     for (int i = 1; i < scale; i++)
     {
-        float t = (float)(i + offset) / (float)(scale - 1);
+        float t = (float)(i + offset) / (float)scale;
         // float interpolated = rank3Coeff * (t * t * t) + rank2Coeff * (t * t) + rank1Coeff * t + rank0Coeff;
         float interpolated = ((rank3Coeff * t + rank2Coeff) * t + rank1Coeff) * t + rank0Coeff; // more efficient
         float clamped = fminf(fmaxf(interpolated, 0.0f), 255.0f);
