@@ -22,6 +22,8 @@ using std::to_string;
 #define threadIdx (dim3{})
 #define blockIdx (dim3{})
 #define blockDim (dim3{})
+#define __syncthreads()
+#define assert(condition)
 #endif
 
 #define HIP_CHECK(expression)                 \

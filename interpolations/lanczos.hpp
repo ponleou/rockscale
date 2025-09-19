@@ -7,8 +7,67 @@
 using std::function;
 using std::vector;
 
-__global__ void lanczosRowInterpolation(const unsigned char *plane, unsigned char *output, const int width, const int height, const int scale, const int window)
+__global__ void lanczosRowInterpolation(const unsigned char *plane, const float *lanczos_kernel, unsigned char *output, const int width, const int height, const int scale, const int window)
 {
+    int thread_idx = threadIdx.x;
+    int global_idx = threadIdx.x + blockIdx.x * blockDim.x;
+
+    int row = global_idx / width; // which row we're in
+    int col = global_idx % width; // which column in that row
+
+    // check bounds
+    if (row >= height || col >= width)
+        return;
+
+    assert((scale - 1) * window > blockDim.x);
+
+    __shared__ float local_kernel[(scale - 1) * window];
+
+    if (thread_idx < (scale - 1) * window)
+        local_kernel[thread_idx] = lanczos_kernel[thread_idx];
+
+    __syncthreads();
+
+    // Starting position in output buffer
+    int output_width = width * scale;
+    int output_row = row * scale;
+    int output_col = col * scale;
+    int output_index = (output_row * output_width) + output_col;
+
+    output[output_index] = plane[global_idx];
+
+    unsigned char values[window];
+    int a = window / 2;
+
+    int row_min_index = row * width;
+    int row_max_index = ((row + 1) * width) - 1;
+
+    // for efficiency, we will start calculating for the first interpolation value with the loop that copies the values in
+    float interpolated = 0;
+    // loop for copying values + calculating first interpolation
+    for (int i = 0; i < window; i++)
+    {
+        // for this forloop, the range of index would be (global_idx - a - 1) to (global_idx + a) inclusive
+        int value_index = fminf(fmaxf(global_idx - a - 1 + i, row_min_index), row_max_index);
+        values[i] = plane[value_index];
+
+        // local kernel for the first interpolation value is from index 0 to window-1
+        interpolated += (float)values[i] * local_kernel[i];
+    }
+
+    output[output_index + 1] = (unsigned char)fminf(fmaxf(interpolated, 0.0f), 255.0f);
+
+    // first interpolation already done, so do for the rest
+    for (int x = 2; x < scale; x++)
+    {
+        interpolated = 0;
+        int kernel_index_offset = (x - 1) * window;
+
+        for (int i = 0; i < window; i++)
+            interpolated += (float)values[i] * local_kernel[i + kernel_index_offset];
+
+        output[output_index + x] = (unsigned char)fminf(fmaxf(interpolated, 0.0f), 255.0f);
+    }
 }
 
 // for each fraction from scale, there is 2*halfWindow multiplier
