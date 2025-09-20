@@ -1282,7 +1282,7 @@ int main(int argc, char *argv[])
     float fps = (float)totalFrames / duration.count();
 
     cout << endl
-         << "Duration: " << fixed << setprecision(2) << seconds << " seconds, " << fixed << setprecision(2) << fps << "fps" << endl;
+         << "Duration: " << fixed << setprecision(2) << seconds << " seconds, " << fixed << setprecision(2) << fps << " fps" << endl;
     cout << totalFrames << " total frames, " << video.getMisplaceFrameCount() << " misplaced frames" << endl;
     return 0;
 }
