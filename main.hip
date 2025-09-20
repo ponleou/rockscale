@@ -22,6 +22,7 @@ extern "C"
 #include <functional>
 #include <utility>
 #include <algorithm>
+#include <iomanip>
 using std::function;
 using std::thread;
 using namespace std::chrono;
@@ -29,6 +30,8 @@ using std::cerr;
 using std::condition_variable;
 using std::cout;
 using std::endl;
+using std::fixed;
+using std::flush;
 using std::logic_error;
 using std::max;
 using std::min;
@@ -36,12 +39,58 @@ using std::mutex;
 using std::pair;
 using std::priority_queue;
 using std::queue;
+using std::setprecision;
 using std::stoi;
 using std::string;
 using std::unique_lock;
 using std::vector;
 
 #define MAX_THREADS thread::hardware_concurrency()
+
+class Logger
+{
+private:
+    mutex locker;
+    condition_variable CV;
+    int maxLine;
+
+public:
+    Logger()
+    {
+        this->maxLine = 0;
+        cout << endl
+             << flush;
+    }
+    ~Logger()
+    {
+        // show cursor
+        cout << "\033[?25h" << flush;
+    }
+
+    void log(int line, string message)
+    {
+        unique_lock<mutex> lock(this->locker);
+
+        // making new lines
+        if (line > this->maxLine)
+        {
+            for (int i = 0; i < line - this->maxLine; i++)
+                cout << "\n";
+
+            cout << "\033[" << line - this->maxLine << "A";
+        }
+
+        // go back up maxLine
+        cout << "\033[" << this->maxLine + 1 << "A";
+        // go down line, start at column 1, and clear
+        cout << "\033[" << line << "B\033[1G\033[2K";
+        // print message
+        cout << message;
+        this->maxLine = max(this->maxLine, line);
+        // go up line, and go down new maxLine
+        cout << "\033[" << line << "A\033[" << this->maxLine + 1 << "B\033[1G" << flush;
+    }
+};
 
 class VideoFFmpeg
 {
@@ -69,6 +118,7 @@ private:
     queue<AVFrame *> decodeBuffer;
     mutex dbufferLocker; // NOTE: must mutex decoderFinished and decodeBuffer
     condition_variable dbufferCV;
+    int decodeFramesCount;
 
     const AVCodec *encoderCodec;
     AVCodecContext *encoder;
@@ -79,6 +129,9 @@ private:
     priority_queue<AVFrame *, vector<AVFrame *>, ComparePTS> encodeBuffer;
     mutex ebufferLocker; // NOTE: must mutex encoderInitialised and encodeBuffer
     condition_variable ebufferCV;
+    int encodeFramesCount;
+
+    int misplaceFramesCount;
 
     void raiseError(string message, int code = -1)
     {
@@ -99,6 +152,9 @@ private:
 
             if (pkt->stream_index == this->videoIndex)
             {
+                if (videoPacket->pts != pkt->pts || videoPacket->dts != pkt->dts)
+                    this->misplaceFramesCount++;
+
                 // Copy the original video packet's timing to our encoded packet
                 videoPacket->pts = av_rescale_q_rnd(pkt->pts, inStream->time_base, outStream->time_base, (AVRounding)(AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
                 videoPacket->dts = av_rescale_q_rnd(pkt->dts, inStream->time_base, outStream->time_base, (AVRounding)(AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
@@ -199,9 +255,74 @@ private:
         }
     }
 
+    // unsafe because no lock
+    void pushDecodeBufferUnsafe(AVFrame *frame)
+    {
+        this->decodeBuffer.push(frame);
+
+        // new frame incoming, wake all waiting for frame
+        this->dbufferCV.notify_all();
+
+        this->decodeFramesCount += 1;
+    }
+
+    void pushDecodeBuffer(AVFrame *frame)
+    {
+        unique_lock<mutex> bufferLock(this->dbufferLocker);
+
+        // sleep if its full
+        while (this->decodeBuffer.size() > this->BATCH_SIZE)
+            this->decoderCV.wait(bufferLock);
+
+        this->pushDecodeBufferUnsafe(frame);
+    }
+
+    void pushDecodeBuffer(AVFrame *frame, Logger *logger, int line)
+    {
+        unique_lock<mutex> bufferLock(this->dbufferLocker);
+
+        // sleep if its full
+        while (this->decodeBuffer.size() > this->BATCH_SIZE)
+            this->decoderCV.wait(bufferLock);
+
+        this->pushDecodeBufferUnsafe(frame);
+
+        if (logger != nullptr)
+        {
+            logger->log(line, "Decoder: " + to_string(this->decodeFramesCount) + " frames");
+        }
+    }
+
+    // unsafe because it needs a locker
+    AVFrame *popEncodeBufferUnsafe()
+    {
+        AVFrame *frame = this->encodeBuffer.top();
+        this->encodeBuffer.pop();
+        this->ebufferCV.notify_all();
+        this->encodeFramesCount += 1;
+
+        return frame;
+    }
+
+    AVFrame *popEncodeBufferUnsafe(Logger *logger, int line)
+    {
+        AVFrame *frame = this->popEncodeBufferUnsafe();
+
+        if (logger != nullptr)
+        {
+            logger->log(line, "Encoder: " + to_string(this->encodeFramesCount) + " frames");
+        }
+
+        return frame;
+    }
+
 public:
     VideoFFmpeg(string fileName, int batchSize, int decodeThreads = 0) : BATCH_SIZE(batchSize)
     {
+        this->decodeFramesCount = 0;
+        this->encodeFramesCount = 0;
+        this->misplaceFramesCount = 0;
+
         int fileCode;
 
         this->inFile = avformat_alloc_context();
@@ -273,7 +394,7 @@ public:
         return (enum AVPixelFormat)this->inFile->streams[this->videoIndex]->codecpar->format;
     }
 
-    void startDecode()
+    void startDecode(Logger *logger = nullptr, int line = 0)
     {
         int sendCode;
         AVPacket *packet = av_packet_alloc();
@@ -296,18 +417,7 @@ public:
 
                     // if we got one, then we put that to the buffer
                     if (recvCode == 0)
-                    {
-                        unique_lock<mutex> bufferLock(this->dbufferLocker);
-
-                        // sleep if its full
-                        while (this->decodeBuffer.size() > this->BATCH_SIZE)
-                            this->decoderCV.wait(bufferLock);
-
-                        this->decodeBuffer.push(frame);
-
-                        // new frame incoming, wake all waiting for frame
-                        this->dbufferCV.notify_all();
-                    }
+                        pushDecodeBuffer(frame, logger, line);
 
                     // no frames available currently, break
                     else if (recvCode == AVERROR(EAGAIN))
@@ -345,15 +455,7 @@ public:
             AVFrame *frame = av_frame_alloc();
             int recvCode = avcodec_receive_frame(this->decoder, frame);
             if (recvCode == 0)
-            {
-                unique_lock<mutex> bufferLock(this->dbufferLocker);
-
-                while (this->decodeBuffer.size() > this->BATCH_SIZE)
-                    this->decoderCV.wait(bufferLock);
-
-                this->decodeBuffer.push(frame);
-                this->dbufferCV.notify_all();
-            }
+                pushDecodeBuffer(frame, logger, line);
             else
             {
                 av_frame_free(&frame);
@@ -551,7 +653,7 @@ public:
         this->encoderCV.notify_all();
     }
 
-    void startEncode(const char *fileName, float thresholdLevel, int threads = 0)
+    void startEncode(const char *fileName, float thresholdLevel, Logger *logger = nullptr, int line = 0, int threads = 0)
     {
         {
             unique_lock<mutex> lock(this->ebufferLocker);
@@ -598,9 +700,7 @@ public:
                     this->encoderCV.wait(lock);
                 }
 
-                frame = this->encodeBuffer.top();
-                this->encodeBuffer.pop();
-                this->ebufferCV.notify_all();
+                frame = this->popEncodeBufferUnsafe(logger, line);
             }
 
             // send a frame, if it is successful go next
@@ -655,8 +755,7 @@ public:
             this->encodeBuffer.push(nullptr); // add to EOF encoder
             while (!this->encodeBuffer.empty())
             {
-                AVFrame *frame = this->encodeBuffer.top();
-                this->encodeBuffer.pop();
+                AVFrame *frame = this->popEncodeBufferUnsafe(logger, line);
                 lock.unlock();
 
                 int codecCode;
@@ -723,20 +822,36 @@ public:
             avio_closep(&this->outFile->pb);
         avformat_free_context(this->outFile);
     }
+
+    int getFrameCount()
+    {
+        return max(this->encodeFramesCount, this->decodeFramesCount);
+    }
+
+    int getMisplaceFrameCount()
+    {
+        return this->misplaceFramesCount;
+    }
 };
 
 class ThreadTask
 {
 private:
+    struct Task
+    {
+        function<void(int)> *function;
+        int num;
+    };
+
     vector<pthread_t> threads;
-    vector<function<void()> *> tasks;
+    vector<Task *> tasks;
     bool started;
 
     static void *functionCaller(void *arg)
     {
-        function<void()> *func = static_cast<function<void()> *>(arg);
-        if (func)
-            (*func)();
+        Task *task = static_cast<Task *>(arg);
+        if (task->function != nullptr)
+            (*task->function)(task->num);
         return nullptr;
     }
 
@@ -746,19 +861,25 @@ public:
     ThreadTask(int threadCount) : size(threadCount)
     {
         this->threads = vector<pthread_t>(this->size);
-        this->tasks = vector<function<void()> *>(this->size, nullptr);
+        this->tasks = vector<Task *>(this->size, nullptr);
         this->started = false;
     }
 
     ~ThreadTask()
     {
         for (int i = 0; i < this->tasks.size(); i++)
-            delete this->tasks[i];
+        {
+            if (this->tasks[i] != nullptr)
+            {
+                delete this->tasks[i]->function;
+                delete this->tasks[i];
+            }
+        }
     }
 
-    void addTask(function<void()> *task, int assignedThread)
+    void addTask(function<void(int)> *task, int assignedThread)
     {
-        this->tasks[assignedThread] = task;
+        this->tasks[assignedThread] = new Task{task, assignedThread};
     }
 
     void start()
@@ -812,8 +933,19 @@ struct ProcessorOptions : InterpolationOptions
     Interpolation interpolation;
 };
 
-void interpolateVideo(VideoFFmpeg &video, Interpolation type, InterpolationOptions &options)
+void postInterpolation(VideoFFmpeg &video, AVFrame *&frame, AVPixelFormat format, Logger *logger = nullptr, int line = 0, int *frameCount = nullptr)
 {
+    *frameCount += 1;
+    if (logger != nullptr)
+        logger->log(line, "Processor " + to_string(line - 1) + ": " + to_string(*frameCount) + " frames");
+
+    video.addEncodeFrames(frame);
+    frame = video.getFrame(format);
+}
+
+void interpolateVideo(VideoFFmpeg &video, Interpolation type, InterpolationOptions &options, Logger *logger = nullptr, int line = 0)
+{
+    int frameCount = 0;
     AVFrame *frame = video.getFrame(options.format);
 
     hipStream_t stream;
@@ -826,8 +958,7 @@ void interpolateVideo(VideoFFmpeg &video, Interpolation type, InterpolationOptio
         do
         {
             bilinearInterpolation(&frame, options.scale, stream, bilinearMemory);
-            video.addEncodeFrames(frame);
-            frame = video.getFrame(options.format);
+            postInterpolation(video, frame, options.format, logger, line, &frameCount);
         } while (frame != nullptr);
     }
 
@@ -839,8 +970,7 @@ void interpolateVideo(VideoFFmpeg &video, Interpolation type, InterpolationOptio
         do
         {
             bicubicInterpolation(&frame, options.scale, stream, bicubicMemory, bicubicTangent);
-            video.addEncodeFrames(frame);
-            frame = video.getFrame(options.format);
+            postInterpolation(video, frame, options.format, logger, line, &frameCount);
         } while (frame != nullptr);
     }
 
@@ -853,27 +983,26 @@ void interpolateVideo(VideoFFmpeg &video, Interpolation type, InterpolationOptio
         do
         {
             lanczosInterpolation(&frame, options.scale, options.halfWindow, *options.kernel, stream, lanczosMemory, lanczosKernel);
-            video.addEncodeFrames(frame);
-            frame = video.getFrame(options.format);
+            postInterpolation(video, frame, options.format, logger, line, &frameCount);
         } while (frame != nullptr);
     }
 
     HIP_CHECK(hipStreamDestroy(stream));
 }
 
-void processor(VideoFFmpeg &video, ProcessorOptions &options)
+void processor(VideoFFmpeg &video, ProcessorOptions &options, Logger &logger, int threadNum)
 {
-    interpolateVideo(video, options.interpolation, options);
+    interpolateVideo(video, options.interpolation, options, &logger, threadNum + 2);
 }
 
-void producer(VideoFFmpeg &video, int scale)
+void producer(VideoFFmpeg &video, int scale, Logger &logger, int threadNum)
 {
-    video.startDecode();
+    video.startDecode(&logger, threadNum + 2);
 }
 
-void consumer(VideoFFmpeg &video, const char *fileName, float thresholdLevel)
+void consumer(VideoFFmpeg &video, const char *fileName, float thresholdLevel, Logger &logger, int threadNum)
 {
-    video.startEncode(fileName, thresholdLevel);
+    video.startEncode(fileName, thresholdLevel, &logger, threadNum + 2);
 }
 
 // just matching whatever format it is with the correct chroma size, but in YUV
@@ -1065,7 +1194,19 @@ int main(int argc, char *argv[])
     Interpolation type = settings.type;
     int halfWindow = settings.halfWindow;
 
+    int deviceCount;
+    HIP_CHECK(hipGetDeviceCount(&deviceCount));
+    if (!(settings.device < deviceCount))
+    {
+        cout << "Device " << settings.device << " not found, using default device" << endl;
+        settings.device = 0;
+    }
+
     HIP_CHECK(hipSetDevice(settings.device));
+
+    hipDeviceProp_t prop;
+    HIP_CHECK(hipGetDeviceProperties(&prop, settings.device))
+    cout << "Device " << settings.device << ": " << prop.name << endl;
 
     // 4 is a good multiplier, idk tho, if u want accuracy, just make it slower
     int batchSize = processorCount * 4;
@@ -1081,9 +1222,17 @@ int main(int argc, char *argv[])
     int threadCount = min(usableThreads, processorCount + 2); // +2 because one for consumer one for producer
     ThreadTask threads(threadCount - 1);                      // -1 because producer is running in main thread
 
-    auto producerTask = [&video, scale]()
+    cout << "Max concurrency threads: " << MAX_THREADS << " threads" << endl;
+    cout << "Using " << threads.size + 1 << " threads, " << processorCount << " processor threads" << endl;
+
+    Logger logger;
+
+    auto start = high_resolution_clock::now();
+
+    int threadNum = 0; // main thread
+    auto producerTask = [&video, scale, &logger](int threadNum)
     {
-        producer(video, scale);
+        producer(video, scale, logger, threadNum);
     };
 
     ProcessorOptions options = {scale, format, 0, nullptr, type};
@@ -1093,38 +1242,47 @@ int main(int argc, char *argv[])
         options.kernel = kernel;
         options.halfWindow = halfWindow;
     }
-
-    auto processorTask = [&video, &options]()
+    auto processorTask = [&video, &options, &logger](int threadNum)
     {
-        processor(video, options);
+        processor(video, options, logger, threadNum);
     };
 
-    auto consumerTask = [&video, output, thresholdLevel]()
+    auto consumerTask = [&video, output, thresholdLevel, &logger](int threadNum)
     {
-        consumer(video, output, thresholdLevel);
+        consumer(video, output, thresholdLevel, logger, threadNum);
     };
 
-    // one thread for consumer
-    threads.addTask(new function<void()>(consumerTask), 0);
+    // all but the last one is the processor
+    for (int i = 0; i < threads.size - 1; i++)
+        threads.addTask(new function<void(int)>(processorTask), i);
 
-    // the rest are processors
-    for (int i = 1; i < threads.size; i++)
-        threads.addTask(new function<void()>(processorTask), i);
+    // the last thread is the consumer
+    threads.addTask(new function<void(int)>(consumerTask), threads.size - 1);
 
     threads.start();
 
-    // main thread is the producer
-    producerTask();
+    // main thread is the producer, -1 is for main thread
+    producerTask(-1);
 
     // once processors are all done, notify end to encoder
-    for (int i = 1; i < threads.size; i++)
+    for (int i = 0; i < threads.size - 1; i++)
         threads.join(i);
 
     // this will allow the consumer/encoder thread to end (or else it will keep running forever)
     video.notifyEndEncode();
 
     // wait for the consumer thread to finish
-    threads.join(0);
+    threads.join(threads.size - 1);
 
+    auto end = high_resolution_clock::now();
+
+    duration<double> duration = end - start;
+    double seconds = duration.count();
+    int totalFrames = video.getFrameCount();
+    float fps = (float)totalFrames / duration.count();
+
+    cout << endl
+         << "Duration: " << fixed << setprecision(2) << seconds << " seconds, " << fixed << setprecision(2) << fps << "fps" << endl;
+    cout << totalFrames << " total frames, " << video.getMisplaceFrameCount() << " misplaced frames" << endl;
     return 0;
 }

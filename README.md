@@ -2,14 +2,14 @@
 
 ### logs
 
--   [ ] gpu device
+-   [x] gpu device
 -   [ ] inputted flags (including threads used)
 -   [ ] scaling to different pixel format (swsscaler)
 -   [ ] fallback encoder
--   [ ] progress for decoer, processor, and encoder
--   [ ] mismatched/error frames count
--   [ ] time taken and fps
--   [ ] threads count
+-   [x] progress for decoer, processor, and encoder
+-   [x] mismatched/error frames count
+-   [x] time taken and fps
+-   [x] threads count
 
 ### flags
 
