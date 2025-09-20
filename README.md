@@ -13,17 +13,17 @@
 
 ### flags
 
--   [ ] performance modes (for different processor counts)
--   [ ] input and output file
--   [ ] scaling
--   [ ] lanczos window size
--   [ ] gpu device number
+-   [x] performance modes (for different processor counts)
+-   [x] input and output file
+-   [x] scaling
+-   [x] lanczos window size
+-   [x] gpu device number
 -   [ ] threshold level _(low priority)_
 
 ### features
 
 -   [ ] threshold adapability _(low priority)_
--   [ ] cli
--   [ ] lanczos kernel multithread
+-   [x] cli
+-   [x] lanczos kernel multithread
 -   [x] cubic interpolation
 -   [x] lanczos resampling
