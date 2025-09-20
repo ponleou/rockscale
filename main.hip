@@ -28,6 +28,7 @@ using std::cerr;
 using std::condition_variable;
 using std::cout;
 using std::endl;
+using std::logic_error;
 using std::max;
 using std::min;
 using std::mutex;
@@ -761,7 +762,7 @@ public:
     void start()
     {
         if (started)
-            throw std::logic_error("Instance is already executed.");
+            throw logic_error("Instance is already executed.");
 
         this->started = true;
         for (int i = 0; i < this->tasks.size(); i++)
@@ -789,36 +790,78 @@ public:
     }
 };
 
-void processor(VideoFFmpeg &video, int scale, AVPixelFormat format)
+enum Interpolation
 {
-    AVFrame *frame = video.getFrame(format);
+    BILINEAR,
+    BICUBIC,
+    LANCZSO,
+};
+
+struct InterpolationOptions
+{
+    int scale;
+    AVPixelFormat format;
+    int halfWindow;
+    LanczosKernel *kernel;
+};
+
+struct ProcessorOptions : InterpolationOptions
+{
+    Interpolation interpolation;
+};
+
+void interpolateVideo(VideoFFmpeg &video, Interpolation type, InterpolationOptions &options)
+{
+    AVFrame *frame = video.getFrame(options.format);
 
     hipStream_t stream;
     HIP_CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
 
-    BilinearGPUMemory bilinearMemory(frame, scale);
-
-    BicubicGPUMemory bicubicMemory(frame, scale);
-    BicubicTangentGPUMemory bicubicTangent(frame, scale);
-
-    int halfWindow = 5;
-
-    LanczosGPUMemory lanczosMemory(frame, scale);
-    LanczosKernelGPUMemory lanczosKernel(scale, halfWindow);
-    LanczosKernel kernel(scale, halfWindow);
-
-    do
+    if (type == BILINEAR)
     {
-        // bilinearInterpolation(&frame, scale, stream, bilinearMemory);
-        // bicubicInterpolation(&frame, scale, stream, bicubicMemory, bicubicTangent);
-        lanczosInterpolation(&frame, scale, halfWindow, kernel, stream, lanczosMemory, lanczosKernel);
+        BilinearGPUMemory bilinearMemory(frame, options.scale);
 
-        video.addEncodeFrames(frame);
+        do
+        {
+            bilinearInterpolation(&frame, options.scale, stream, bilinearMemory);
+            video.addEncodeFrames(frame);
+            frame = video.getFrame(options.format);
+        } while (frame != nullptr);
+    }
 
-        frame = video.getFrame(format);
-    } while (frame != nullptr);
+    else if (type == BICUBIC)
+    {
+        BicubicGPUMemory bicubicMemory(frame, options.scale);
+        BicubicTangentGPUMemory bicubicTangent(frame, options.scale);
+
+        do
+        {
+            bicubicInterpolation(&frame, options.scale, stream, bicubicMemory, bicubicTangent);
+            video.addEncodeFrames(frame);
+            frame = video.getFrame(options.format);
+        } while (frame != nullptr);
+    }
+
+    else if (type == LANCZSO)
+    {
+        LanczosGPUMemory lanczosMemory(frame, options.scale);
+        LanczosKernelGPUMemory lanczosKernel(options.scale, options.halfWindow);
+        lanczosKernel.memcpyKernel(*options.kernel, stream);
+
+        do
+        {
+            lanczosInterpolation(&frame, options.scale, options.halfWindow, *options.kernel, stream, lanczosMemory, lanczosKernel);
+            video.addEncodeFrames(frame);
+            frame = video.getFrame(options.format);
+        } while (frame != nullptr);
+    }
 
     HIP_CHECK(hipStreamDestroy(stream));
+}
+
+void processor(VideoFFmpeg &video, ProcessorOptions &options)
+{
+    interpolateVideo(video, options.interpolation, options);
 }
 
 void producer(VideoFFmpeg &video, int scale)
@@ -862,9 +905,11 @@ int main(int argc, char *argv[])
     // settings
     int processorCount = 1;
     float thresholdLevel = 0.75;
-    int scale = 6;
+    int scale = 2;
     const char *input = "input.mov";
     const char *output = "output.mov";
+    Interpolation type = LANCZSO;
+    int halfWindow = 5;
 
     HIP_CHECK(hipSetDevice(0)); // setting HIP device to default
 
@@ -886,9 +931,17 @@ int main(int argc, char *argv[])
         producer(video, scale);
     };
 
-    auto processorTask = [&video, scale, format]()
+    ProcessorOptions options = {scale, format, 0, nullptr, type};
+    if (type == LANCZSO)
     {
-        processor(video, scale, format);
+        LanczosKernel *kernel = new LanczosKernel(options.scale, halfWindow);
+        options.kernel = kernel;
+        options.halfWindow = halfWindow;
+    }
+
+    auto processorTask = [&video, &options]()
+    {
+        processor(video, options);
     };
 
     auto consumerTask = [&video, output, thresholdLevel]()

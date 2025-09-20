@@ -5,6 +5,7 @@
 #include <cmath>
 #include <pthread.h>
 using std::function;
+using std::min;
 using std::vector;
 
 __global__ void lanczosRowInterpolate(const unsigned char *plane, const float *lanczos_kernel, unsigned char *output, const int width, const int height, const int scale, const int window)
@@ -182,6 +183,7 @@ private:
     void lanczosMultiplier(float *output, int threads)
     {
         int jobCount = (this->scale - 1) * 2 * this->halfWindow;
+        threads = min(threads, jobCount);
         int threadsJob = floor((float)jobCount / (float)threads);
         int mainsJob = jobCount - (threadsJob * (threads - 1));
 
@@ -221,10 +223,14 @@ public:
 
 class LanczosKernelGPUMemory : public GPUMemory<float, 1>
 {
+private:
+    int size;
+
 public:
     LanczosKernelGPUMemory(int scale, int halfWindow)
     {
-        this->allocate({(scale - 1) * 2 * halfWindow});
+        this->size = (scale - 1) * 2 * halfWindow;
+        this->allocate({this->size});
     }
 
     enum MemoryPosition
@@ -239,8 +245,14 @@ public:
                 throw invalid_argument("Memory sizes don't match at index " + to_string(i) + ", potential mismatched frames");
     }
 
+    void memcpyKernel(LanczosKernel &kernel, hipStream_t &stream)
+    {
+        HIP_CHECK(hipMemcpyAsync(this->operator[](KERNEL), kernel.getKernel(), this->size * sizeof(float), hipMemcpyHostToDevice, stream));
+    }
+
     // the index is unused, always return KERNEL
-    float *&operator[](int unused) override
+    float *&
+    operator[](int unused) override
     {
         return GPUMemory<float, 1>::operator[](KERNEL);
     }
@@ -323,10 +335,6 @@ void lanczosInterpolation(AVFrame **frame, int scale, int halfWindow, LanczosKer
     int kernelSize = (scale - 1) * window;
 
     kernelMemory.validateMemorySizes({kernelSize});
-
-    float *kernelOutput = kernel.getKernel();
-
-    HIP_CHECK(hipMemcpyAsync(kernelMemory[0], kernelOutput, kernelSize * sizeof(float), hipMemcpyHostToDevice, stream));
 
     uint8_t *YPlane = (*frame)->data[0];
     uint8_t *UPlane = (*frame)->data[1];
