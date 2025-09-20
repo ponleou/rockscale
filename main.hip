@@ -12,6 +12,7 @@ extern "C"
 
 #include <mutex>
 #include <string>
+#include <cstdlib>
 #include <vector>
 #include <queue>
 #include <condition_variable>
@@ -35,6 +36,7 @@ using std::mutex;
 using std::pair;
 using std::priority_queue;
 using std::queue;
+using std::stoi;
 using std::string;
 using std::unique_lock;
 using std::vector;
@@ -794,7 +796,7 @@ enum Interpolation
 {
     BILINEAR,
     BICUBIC,
-    LANCZSO,
+    LANCZOS,
 };
 
 struct InterpolationOptions
@@ -842,7 +844,7 @@ void interpolateVideo(VideoFFmpeg &video, Interpolation type, InterpolationOptio
         } while (frame != nullptr);
     }
 
-    else if (type == LANCZSO)
+    else if (type == LANCZOS)
     {
         LanczosGPUMemory lanczosMemory(frame, options.scale);
         LanczosKernelGPUMemory lanczosKernel(options.scale, options.halfWindow);
@@ -895,26 +897,179 @@ AVPixelFormat convertToYUV(AVPixelFormat format)
     return AV_PIX_FMT_NONE;
 }
 
+struct FlagOptions
+{
+    const char *input;
+    const char *output;
+    int scale;
+    Interpolation type;
+    int halfWindow;
+    int device;
+    int unsafeThreads;
+};
+
+void unknownFlag(const char *flag)
+{
+    cout << "Error: unknown option " << "\"" << flag << "\"" << endl;
+    exit(1);
+}
+
+void unknownValue(string flag, const char *value, string expected)
+{
+    cout << "Error: unknown value for " << flag << " flag: " << "\"" << value << "\"" << ", expected " << expected << endl;
+    exit(1);
+}
+
+void printHelp(const char *programName)
+{
+    cout << "Usage: " << programName << " [options]\n\n";
+    cout << "Options:\n";
+    cout << "  -h, --help                  Show this help message and exit\n";
+    cout << "  -i, --input <file>          Input video file\n";
+    cout << "  -o, --output <file>         Output video file\n";
+    cout << "  -s, --scaling <int>         Scaling factor (integer)\n";
+    cout << "  -t, --type <mode>           Upscaling interpolation type (\"bilinear\", \"bicubic\", or \"lanczos\")\n";
+    cout << "  -hw, --half-window <int>    Half-window size, only in use for \"lanczos\" interpolation type (integer, default: 5)\n";
+    cout << "  -d, --device <int>          Device index to use (integer, default: 0)\n";
+    cout << "  -ut, --unsafe-threads <int> Number of threads, faster but may cause frame misplacement, keep at default for safe value (integer, default: 1)\n";
+
+    exit(0);
+}
+
+void checkFlags(int argc, char *argv[], FlagOptions &flags)
+{
+    // default values
+    flags.device = 0;
+    flags.unsafeThreads = 1;
+    flags.halfWindow = 5;
+
+    // required flags
+    bool input = false;
+    bool output = false;
+    bool scaling = false;
+    bool type = false;
+
+    for (int i = 1; i < argc; i++)
+    {
+        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0)
+            printHelp(argv[0]);
+        else if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--input") == 0)
+        {
+            i++;
+            flags.input = argv[i];
+            input = true;
+        }
+        else if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0)
+        {
+            i++;
+            flags.output = argv[i];
+            output = true;
+        }
+        else if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--scaling") == 0)
+        {
+            i++;
+            try
+            {
+                flags.scale = stoi(argv[i]);
+            }
+            catch (invalid_argument)
+            {
+                unknownValue("--scaling", argv[i], "integer");
+            }
+            scaling = true;
+        }
+        else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--type") == 0)
+        {
+            i++;
+            if (strcmp(argv[i], "bilinear") == 0)
+                flags.type = BILINEAR;
+            else if (strcmp(argv[i], "bicubic") == 0)
+                flags.type = BICUBIC;
+            else if (strcmp(argv[i], "lanczos") == 0)
+                flags.type = LANCZOS;
+            else
+                unknownValue("--type", argv[i], "\"bilinear\", \"bicubic\", or \"lanczos\"");
+
+            type = true;
+        }
+        else if (strcmp(argv[i], "-hw") == 0 || strcmp(argv[i], "--half-window") == 0)
+        {
+            i++;
+            try
+            {
+                flags.halfWindow = stoi(argv[i]);
+            }
+            catch (invalid_argument)
+            {
+                unknownValue("--half-window", argv[i], "integer");
+            }
+        }
+        else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--device") == 0)
+        {
+            i++;
+            try
+            {
+                flags.device = stoi(argv[i]);
+            }
+            catch (invalid_argument)
+            {
+                unknownValue("--device", argv[i], "integer");
+            }
+        }
+        else if (strcmp(argv[i], "-ut") == 0 || strcmp(argv[i], "--unsafe-threads") == 0)
+        {
+            i++;
+            try
+            {
+                flags.unsafeThreads = stoi(argv[i]);
+            }
+            catch (invalid_argument)
+            {
+                unknownValue("--unsafe-threads", argv[i], "integer");
+            }
+        }
+        else
+            unknownFlag(argv[i]);
+    }
+
+    if (!(input && output && scaling && type))
+    {
+        cout << "Error: missing options" << endl;
+        exit(1);
+    }
+}
+
 int main(int argc, char *argv[])
 {
-    av_log_set_level(AV_LOG_DEBUG);
+    // av_log_set_level(AV_LOG_DEBUG);
+    av_log_set_level(AV_LOG_FATAL);
+#ifdef _WIN32
+    freopen("NUL", "w", stderr);
+#else
+    freopen("/dev/null", "w", stderr);
+#endif
 
     // we need at least 3 threads total: producer, processor, consumer
-    int usableThreads = max(static_cast<int>(MAX_THREADS), 3);
+    int usableThreads = max((int)(MAX_THREADS), 3);
+    int maxProcessor = usableThreads - 2;
+
+    FlagOptions settings;
+    checkFlags(argc, argv, settings);
 
     // settings
-    int processorCount = 1;
     float thresholdLevel = 0.75;
-    int scale = 2;
-    const char *input = "input.mov";
-    const char *output = "output.mov";
-    Interpolation type = LANCZSO;
-    int halfWindow = 5;
+    int processorCount = min(settings.unsafeThreads, maxProcessor);
+    int scale = settings.scale;
+    const char *input = settings.input;
+    const char *output = settings.output;
+    Interpolation type = settings.type;
+    int halfWindow = settings.halfWindow;
 
-    HIP_CHECK(hipSetDevice(0)); // setting HIP device to default
+    HIP_CHECK(hipSetDevice(settings.device));
 
     // 4 is a good multiplier, idk tho, if u want accuracy, just make it slower
-    VideoFFmpeg video(input, processorCount * 4);
+    int batchSize = processorCount * 4;
+    VideoFFmpeg video(input, batchSize);
 
     AVPixelFormat format = convertToYUV(video.getPixelFormat());
 
@@ -932,7 +1087,7 @@ int main(int argc, char *argv[])
     };
 
     ProcessorOptions options = {scale, format, 0, nullptr, type};
-    if (type == LANCZSO)
+    if (type == LANCZOS)
     {
         LanczosKernel *kernel = new LanczosKernel(options.scale, halfWindow);
         options.kernel = kernel;
