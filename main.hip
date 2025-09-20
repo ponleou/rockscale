@@ -1060,7 +1060,7 @@ void printHelp(const char *programName)
     cout << "  -t, --type <mode>           Upscaling interpolation type (\"bilinear\", \"bicubic\", or \"lanczos\")\n";
     cout << "  -hw, --half-window <int>    Half-window size, only in use for \"lanczos\" interpolation type (integer, default: 5)\n";
     cout << "  -d, --device <int>          Device index to use (integer, default: 0)\n";
-    cout << "  -ut, --unsafe-threads <int> Number of threads, faster but may cause frame misplacement, keep at default for safe value (integer, default: 1)\n";
+    cout << "  -ut, --unsafe-threads <int> Number of threads, may be faster but causes frame misplacement, keep at default for safe value (integer, default: 1)\n";
 
     exit(0);
 }
