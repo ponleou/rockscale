@@ -221,7 +221,7 @@ private:
         if (this->outFile->oformat->flags & AVFMT_GLOBALHEADER)
             this->encoder->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 
-        // open encoder
+        // NOTE: opening encoder cant be done in initialiseEncoder, hevc fails
         int codecCode;
         if ((codecCode = avcodec_open2(this->encoder, this->encoderCodec, nullptr)) < 0)
             this->raiseError("Failed to start encoder", codecCode);
@@ -524,7 +524,7 @@ public:
         return convertedFrame;
     }
 
-    void initialiseEncoder(int width, int height, AVPixelFormat format)
+    void initialiseEncoder(int width, int height, AVPixelFormat format, bool useHardware = false, int threads = 0)
     {
         {
             unique_lock<mutex> lock(this->ebufferLocker);
@@ -537,26 +537,69 @@ public:
         height &= ~1;
 
         // try to find original codec, if not, theres a list of fallbacks
-        this->encoderCodec = avcodec_find_encoder(this->inFile->streams[this->videoIndex]->codecpar->codec_id);
-        if (this->encoderCodec == nullptr)
+        AVCodecID codecId = this->inFile->streams[this->videoIndex]->codecpar->codec_id;
+
+        // FIXME: this is not finished yet, nearly none of the hardware encoders use YUV pixel format
+        // this is a WIP
+        if (useHardware)
         {
-            // trying different ones, in order of most compatible
-            AVCodecID fallbackCodecs[] = {AV_CODEC_ID_H264, AV_CODEC_ID_H265, AV_CODEC_ID_VP9, AV_CODEC_ID_AV1};
-            for (AVCodecID codecId : fallbackCodecs)
+            void *i = nullptr;
+            while ((this->encoderCodec = av_codec_iterate(&i)))
             {
-                this->encoderCodec = avcodec_find_encoder(codecId);
-                if (this->encoderCodec != nullptr)
-                    break;
+                // checking if the codec supports encoding, is the same codecId we are looking for, and is hardware
+                if (av_codec_is_encoder(this->encoderCodec) && this->encoderCodec->id == codecId && avcodec_get_hw_config(this->encoderCodec, 0) != nullptr)
+                    // checking if we can open this encoder codec
+                    if ((this->encoder = avcodec_alloc_context3(this->encoderCodec)) != nullptr)
+                    {
+                        // setting necessary parameters to check if we can open encoder
+                        this->encoder->width = 16;
+                        this->encoder->height = 16;
+                        this->encoder->time_base = {1, 30};
+                        this->encoder->pix_fmt = format;
+
+                        // if we can open, then we will use this codec
+                        if (avcodec_open2(this->encoder, this->encoderCodec, nullptr) == 0)
+                        {
+                            // reset
+                            avcodec_free_context(&this->encoder);
+                            this->encoder = nullptr;
+                            this->encoder = avcodec_alloc_context3(this->encoderCodec);
+                            break;
+                        }
+
+                        // if this codec doesnt work, then we go next
+                        avcodec_free_context(&this->encoder);
+                        this->encoder = nullptr;
+                    }
             }
+            // if after testing all, we didnt have a hardware encoder, just use software
+            if (this->encoder == nullptr)
+                useHardware = false;
         }
 
-        if (this->encoderCodec == nullptr)
-            this->raiseError("No suitable encoder found");
+        if (!useHardware)
+        {
+            this->encoderCodec = avcodec_find_encoder(codecId);
+            if (this->encoderCodec == nullptr)
+            {
+                // trying different ones, in order of most compatible
+                AVCodecID fallbackCodecs[] = {AV_CODEC_ID_H264, AV_CODEC_ID_H265, AV_CODEC_ID_VP9, AV_CODEC_ID_AV1};
+                for (AVCodecID codecId : fallbackCodecs)
+                {
+                    this->encoderCodec = avcodec_find_encoder(codecId);
+                    if (this->encoderCodec != nullptr)
+                        break;
+                }
+            }
 
-        this->encoder = avcodec_alloc_context3(this->encoderCodec);
+            if (this->encoderCodec == nullptr)
+                this->raiseError("No suitable encoder codec found");
 
-        if (this->encoder == nullptr)
-            this->raiseError("Failed to find encoder");
+            this->encoder = avcodec_alloc_context3(this->encoderCodec);
+
+            if (this->encoder == nullptr)
+                this->raiseError("Failed to find encoder");
+        }
 
         this->encoder->width = width;
         this->encoder->height = height;
@@ -618,6 +661,9 @@ public:
         float scale = (float)newSize / (float)originalSize;
         this->encoder->bit_rate = fileBitrate * scale;
 
+        this->encoder->thread_count = threads;
+        this->encoder->thread_type = FF_THREAD_FRAME;
+
         unique_lock<mutex> lock(this->ebufferLocker);
         this->encoderInitialised = true;
         this->ebufferCV.notify_all();
@@ -637,6 +683,8 @@ public:
 
         unique_lock<mutex> lock(this->ebufferLocker);
 
+        // TODO: encoder is the bottle neck, so limiting the size also slows down processors and decoders
+        // but unlimiting the size is a disaster, dont
         while (this->encodeBuffer.size() > BATCH_SIZE)
         {
             this->ebufferCV.wait(lock);
@@ -653,7 +701,7 @@ public:
         this->encoderCV.notify_all();
     }
 
-    void startEncode(const char *fileName, float thresholdLevel, Logger *logger = nullptr, int line = 0, int threads = 0)
+    void startEncode(const char *fileName, float thresholdLevel, Logger *logger = nullptr, int line = 0)
     {
         {
             unique_lock<mutex> lock(this->ebufferLocker);
@@ -665,9 +713,6 @@ public:
         // the less frames there are, the more likely that the inordered frame as not arrived in the buffer yet
         int threshold = this->BATCH_SIZE;
         const int minThreshold = this->BATCH_SIZE * thresholdLevel;
-
-        this->encoder->thread_count = threads;
-        this->encoder->thread_type = FF_THREAD_FRAME;
 
         this->prepareEncode(fileName);
 
@@ -1180,19 +1225,25 @@ int main(int argc, char *argv[])
 
     // we need at least 3 threads total: producer, processor, consumer
     int usableThreads = max((int)(MAX_THREADS), 3);
-    int maxProcessor = usableThreads - 2;
 
     FlagOptions settings;
     checkFlags(argc, argv, settings);
 
-    // settings
     float thresholdLevel = 0.75;
-    int processorCount = min(settings.unsafeThreads, maxProcessor);
+
+    // settings
     int scale = settings.scale;
     const char *input = settings.input;
     const char *output = settings.output;
     Interpolation type = settings.type;
     int halfWindow = settings.halfWindow;
+
+    int maxProcessor = usableThreads - 2;
+    int processorThreads = min(settings.unsafeThreads, maxProcessor);
+
+    float remainingThreads = usableThreads - processorThreads;
+    int decoderThreads = ceil(remainingThreads / (float)scale);
+    int encoderThreads = remainingThreads - decoderThreads;
 
     int deviceCount;
     HIP_CHECK(hipGetDeviceCount(&deviceCount));
@@ -1209,21 +1260,22 @@ int main(int argc, char *argv[])
     cout << "Device " << settings.device << ": " << prop.name << endl;
 
     // 4 is a good multiplier, idk tho, if u want accuracy, just make it slower
-    int batchSize = processorCount * 4;
-    VideoFFmpeg video(input, batchSize);
-
-    AVPixelFormat format = convertToYUV(video.getPixelFormat());
+    int batchSize = processorThreads * 4;
+    VideoFFmpeg video(input, batchSize, decoderThreads);
 
     pair<int, int> dimension = video.getDimension();
     int scaledWidth = dimension.first * scale;
     int scaledHeight = dimension.second * scale;
-    video.initialiseEncoder(scaledWidth, scaledHeight, format);
+    AVPixelFormat format = convertToYUV(video.getPixelFormat());
 
-    int threadCount = min(usableThreads, processorCount + 2); // +2 because one for consumer one for producer
-    ThreadTask threads(threadCount - 1);                      // -1 because producer is running in main thread
+    // TODO: use hardware encoding when feature is finished
+    video.initialiseEncoder(scaledWidth, scaledHeight, format, false, encoderThreads);
+
+    int threadCount = min(usableThreads, processorThreads + 2); // +2 because one for consumer one for producer
+    ThreadTask threads(threadCount - 1);                        // -1 because producer is running in main thread
 
     cout << "Max concurrency threads: " << MAX_THREADS << " threads" << endl;
-    cout << "Using " << threads.size + 1 << " threads, " << processorCount << " processor threads" << endl;
+    cout << "Using " << usableThreads << " threads, " << decoderThreads << " decoder threads, " << processorThreads << " processor threads, " << encoderThreads << " encoder threads" << endl;
 
     Logger logger;
 

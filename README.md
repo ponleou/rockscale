@@ -27,3 +27,4 @@
 -   [x] lanczos kernel multithread
 -   [x] cubic interpolation
 -   [x] lanczos resampling
+-   [ ] allow hardware encoding
