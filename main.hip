@@ -1242,7 +1242,9 @@ int main(int argc, char *argv[])
     int processorThreads = min(settings.unsafeThreads, maxProcessor);
 
     float remainingThreads = usableThreads - processorThreads;
-    int decoderThreads = ceil(remainingThreads / (float)scale);
+    // decoding is not the bottleneck
+    int decoderThreads = 1;
+    // encoding is the main bottleneck, we will give it all remaining threads
     int encoderThreads = remainingThreads - decoderThreads;
 
     int deviceCount;
