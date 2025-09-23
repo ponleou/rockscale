@@ -58,6 +58,8 @@ private:
     const AVCodec *encoderCodec;
     AVCodecContext *encoder;
     condition_variable encoderCV;
+    bool hwEncoder;
+    AVHWFramesContext *hwFramesCtx;
 
     bool encoderInitialised;
     bool encodeEnded;
@@ -70,7 +72,8 @@ private:
 
     void raiseError(string message, int code = -1)
     {
-        cerr << message << ", code: " << code << endl;
+        cout << endl;
+        cout << "ERROR: " << message << ", code: " << code << endl;
         exit(code);
     }
 
@@ -257,6 +260,7 @@ public:
         this->decodeFramesCount = 0;
         this->encodeFramesCount = 0;
         this->misplaceFramesCount = 0;
+        this->hwEncoder = false;
 
         int fileCode;
 
@@ -459,6 +463,74 @@ public:
         return convertedFrame;
     }
 
+    // FIXME: this is not finished yet, nearly none of the hardware encoders use YUV pixel format
+    // this is a WIP
+    void findHwEncoder(int width, int height, AVPixelFormat format, AVCodecID codecId)
+    {
+        void *i = nullptr;
+        while ((this->encoderCodec = av_codec_iterate(&i)))
+        {
+            // checking if the codec supports encoding, is the same codecId we are looking for, and is hardware
+            const AVCodecHWConfig *config = nullptr;
+            if (av_codec_is_encoder(this->encoderCodec) && this->encoderCodec->id == codecId && (config = avcodec_get_hw_config(this->encoderCodec, 0)) != nullptr)
+                // checking if we can open this encoder codec
+                if ((this->encoder = avcodec_alloc_context3(this->encoderCodec)) != nullptr)
+                {
+
+                    AVBufferRef *hwDevice = nullptr;
+                    if (av_hwdevice_ctx_create(&hwDevice, config->device_type, nullptr, nullptr, 0) != 0)
+                    {
+                        avcodec_free_context(&this->encoder);
+                        this->encoder = nullptr;
+                        continue;
+                    }
+
+                    // setting necessary parameters to check if we can open encoder
+                    this->encoder->width = width;
+                    this->encoder->height = height;
+                    // NOTE: hw encoder have a width and height limit apparently
+
+                    this->encoder->time_base = this->inFile->streams[this->videoIndex]->time_base;
+                    this->encoder->pix_fmt = config->pix_fmt;
+                    this->encoder->hw_device_ctx = hwDevice;
+                    this->encoder->sw_pix_fmt = format;
+
+                    AVBufferRef *hwBufferRef = av_hwframe_ctx_alloc(hwDevice);
+                    AVHWFramesContext *hwFramesCtx = (AVHWFramesContext *)hwBufferRef->data;
+                    hwFramesCtx->format = config->pix_fmt;
+                    hwFramesCtx->width = this->encoder->width;
+                    hwFramesCtx->height = this->encoder->height;
+                    hwFramesCtx->sw_format = format;
+
+                    if (av_hwframe_ctx_init(hwBufferRef) < 0)
+                    {
+                        av_buffer_unref(&hwBufferRef);
+                        av_buffer_unref(&hwDevice);
+                        avcodec_free_context(&this->encoder);
+                        this->encoder = nullptr;
+                        continue;
+                    }
+
+                    this->encoder->hw_frames_ctx = hwBufferRef;
+
+                    // if we can open, then we will use this codec
+                    if (avcodec_open2(this->encoder, this->encoderCodec, nullptr) == 0)
+                    {
+                        // reset
+                        avcodec_free_context(&this->encoder);
+                        this->encoder = nullptr;
+                        this->encoder = avcodec_alloc_context3(this->encoderCodec);
+                        this->hwEncoder = true;
+                        return;
+                    }
+
+                    // if this codec doesnt work, then we go next
+                    avcodec_free_context(&this->encoder);
+                    this->encoder = nullptr;
+                }
+        }
+    }
+
     void initialiseEncoder(int width, int height, AVPixelFormat format, bool useHardware = false, int threads = 0)
     {
         {
@@ -474,45 +546,12 @@ public:
         // try to find original codec, if not, theres a list of fallbacks
         AVCodecID codecId = this->inFile->streams[this->videoIndex]->codecpar->codec_id;
 
-        // FIXME: this is not finished yet, nearly none of the hardware encoders use YUV pixel format
-        // this is a WIP
         if (useHardware)
-        {
-            void *i = nullptr;
-            while ((this->encoderCodec = av_codec_iterate(&i)))
-            {
-                // checking if the codec supports encoding, is the same codecId we are looking for, and is hardware
-                if (av_codec_is_encoder(this->encoderCodec) && this->encoderCodec->id == codecId && avcodec_get_hw_config(this->encoderCodec, 0) != nullptr)
-                    // checking if we can open this encoder codec
-                    if ((this->encoder = avcodec_alloc_context3(this->encoderCodec)) != nullptr)
-                    {
-                        // setting necessary parameters to check if we can open encoder
-                        this->encoder->width = 16;
-                        this->encoder->height = 16;
-                        this->encoder->time_base = {1, 30};
-                        this->encoder->pix_fmt = format;
+            // this will make hwEncoder true if theres one available
+            this->findHwEncoder(width, height, format, codecId);
 
-                        // if we can open, then we will use this codec
-                        if (avcodec_open2(this->encoder, this->encoderCodec, nullptr) == 0)
-                        {
-                            // reset
-                            avcodec_free_context(&this->encoder);
-                            this->encoder = nullptr;
-                            this->encoder = avcodec_alloc_context3(this->encoderCodec);
-                            break;
-                        }
-
-                        // if this codec doesnt work, then we go next
-                        avcodec_free_context(&this->encoder);
-                        this->encoder = nullptr;
-                    }
-            }
-            // if after testing all, we didnt have a hardware encoder, just use software
-            if (this->encoder == nullptr)
-                useHardware = false;
-        }
-
-        if (!useHardware)
+        // if we are not using hwEncoder, we fallback to software
+        if (!this->hwEncoder)
         {
             this->encoderCodec = avcodec_find_encoder(codecId);
             if (this->encoderCodec == nullptr)
@@ -535,6 +574,8 @@ public:
             if (this->encoder == nullptr)
                 this->raiseError("Failed to find encoder");
         }
+
+        cout << this->encoderCodec->name << endl;
 
         this->encoder->width = width;
         this->encoder->height = height;
@@ -599,6 +640,38 @@ public:
         this->encoder->thread_count = threads;
         this->encoder->thread_type = FF_THREAD_FRAME;
 
+        if (this->hwEncoder)
+        {
+            int code;
+            // NOTE: none of these stuff should fail, we already tested in findHwEncoder function
+            const AVCodecHWConfig *config = nullptr;
+            config = avcodec_get_hw_config(this->encoderCodec, 0);
+
+            AVBufferRef *hwDevice = nullptr;
+            if ((code = av_hwdevice_ctx_create(&hwDevice, config->device_type, nullptr, nullptr, 0)) != 0)
+                this->raiseError("Unexpected error in initialising hardware encoder", code);
+
+            // change some of the encoder parameters
+            this->encoder->pix_fmt = config->pix_fmt;
+            this->encoder->hw_device_ctx = hwDevice;
+            this->encoder->sw_pix_fmt = format;
+
+            cout << "format " << av_pix_fmt_desc_get(format)->name << endl;
+
+            AVBufferRef *hwBufferRef = av_hwframe_ctx_alloc(hwDevice);
+            AVHWFramesContext *hwFramesCtx = (AVHWFramesContext *)hwBufferRef->data;
+            hwFramesCtx->format = config->pix_fmt;
+            hwFramesCtx->width = this->encoder->width;
+            hwFramesCtx->height = this->encoder->height;
+            hwFramesCtx->sw_format = format;
+            if ((code = av_hwframe_ctx_init(hwBufferRef)) != 0)
+                this->raiseError("Unexpected error in initialising hardware encoder", code);
+
+            this->encoder->hw_frames_ctx = hwBufferRef;
+
+            this->hwFramesCtx = hwFramesCtx;
+        }
+
         unique_lock<mutex> lock(this->ebufferLocker);
         this->encoderInitialised = true;
         this->ebufferCV.notify_all();
@@ -610,6 +683,32 @@ public:
             unique_lock<mutex> lock(this->ebufferLocker);
             if (!this->encoderInitialised)
                 this->raiseError("Encoder not initialised");
+        }
+
+        // prepare frame for hw encoder
+        if (this->hwEncoder)
+        {
+            AVFrame *hwFrame = av_frame_alloc();
+            hwFrame->format = this->encoder->pix_fmt;
+            hwFrame->width = this->encoder->width;
+            hwFrame->height = this->encoder->height;
+            hwFrame->hw_frames_ctx = this->encoder->hw_frames_ctx;
+
+            int code;
+            if ((code = av_hwframe_get_buffer(encoder->hw_frames_ctx, hwFrame, 0)) < 0)
+            {
+                av_frame_free(&hwFrame);
+                this->raiseError("Failed to convert software frame to hardware frame", code);
+            }
+
+            if ((code = av_hwframe_transfer_data(hwFrame, frame, 0)) < 0)
+            {
+                av_frame_free(&hwFrame);
+                this->raiseError("Failed to convert software frame to hardware frame", code);
+            }
+
+            av_frame_free(&frame);
+            frame = hwFrame;
         }
 
         // apply even for width and height

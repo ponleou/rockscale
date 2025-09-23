@@ -441,7 +441,7 @@ int main(int argc, char *argv[])
     AVPixelFormat format = convertToYUV(video.getPixelFormat());
 
     // TODO: use hardware encoding when feature is finished
-    video.initialiseEncoder(scaledWidth, scaledHeight, format, false, encoderThreads);
+    video.initialiseEncoder(scaledWidth, scaledHeight, format, true, encoderThreads);
 
     int threadCount = min(usableThreads, processorThreads + 2); // +2 because one for consumer one for producer
     ThreadTask threads(threadCount - 1);                        // -1 because producer is running in main thread
