@@ -453,15 +453,19 @@ int main(int argc, char *argv[])
     int threadCount = min(usableThreads, processorThreads + 2); // +2 because one for consumer one for producer
     ThreadTask threads(threadCount - 1);                        // -1 because producer is running in main thread
 
-    cout << "Device " << settings.device << ": " << prop.name << endl;
+    cout << "========== DEVICES ==========" << endl;
     cout << "Decoder: " << video.getDecoder() << endl;
+    cout << "Processor device " << settings.device << ": " << prop.name << endl;
     cout << "Encoder: " << video.getEncoder() << endl;
     cout << endl;
 
+    cout << "========== SETTINGS ==========" << endl;
     cout << "Max concurrency threads: " << MAX_THREADS << " threads" << endl;
     cout << "Using " << usableThreads << " threads, " << decoderThreads << " decoder threads, " << processorThreads << " processor threads, " << encoderThreads << " encoder threads" << endl;
 
     Logger logger;
+    cout << endl;
+    cout << "========== PROGRESS ==========" << endl;
 
     auto start = high_resolution_clock::now();
 
@@ -517,8 +521,9 @@ int main(int argc, char *argv[])
     int totalFrames = video.getFrameCount();
     float fps = (float)totalFrames / duration.count();
 
-    cout << endl
-         << "Duration: " << fixed << setprecision(2) << seconds << " seconds, " << fixed << setprecision(2) << fps << " fps" << endl;
+    cout << endl;
+    cout << "========== RESULTS ==========" << endl;
+    cout << "Duration: " << fixed << setprecision(2) << seconds << " seconds, " << fixed << setprecision(2) << fps << " fps" << endl;
     cout << totalFrames << " total frames, " << video.getMisplaceFrameCount() << " misplaced frames" << endl;
     return 0;
 }

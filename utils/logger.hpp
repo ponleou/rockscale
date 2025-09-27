@@ -21,8 +21,6 @@ public:
     Logger()
     {
         this->maxLine = 0;
-        cout << endl
-             << flush;
     }
     ~Logger()
     {
