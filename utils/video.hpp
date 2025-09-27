@@ -278,6 +278,11 @@ public:
 
         return convertedFrame;
     }
+
+    string getDecoder()
+    {
+        return this->decoder->codec->name;
+    }
 };
 
 class VideoPipeline : public VideoDecoder
@@ -299,8 +304,10 @@ private:
     const AVCodec *encoderCodec;
     AVCodecContext *encoder;
     condition_variable encoderCV;
-    bool hwEncoder;
     AVHWFramesContext *hwFramesCtx;
+    bool hwEncoder;
+
+    AVPixelFormat swFormat;
 
     priority_queue<AVFrame *, vector<AVFrame *>, ComparePTS> encodeBuffer;
     mutex ebufferLocker; // NOTE: must mutex encoderInitialised and encodeBuffer
@@ -453,8 +460,11 @@ private:
 
     // FIXME: this is not finished yet, nearly none of the hardware encoders use YUV pixel format
     // this is a WIP
-    void findHwEncoder(int width, int height, AVPixelFormat format, AVCodecID codecId)
+    void findHwEncoder(int width, int height, AVCodecID codecId)
     {
+        // FIXME: hardcoded NV12 format
+        AVPixelFormat sw = AV_PIX_FMT_NV12;
+
         void *i = nullptr;
         while ((this->encoderCodec = av_codec_iterate(&i)))
         {
@@ -481,14 +491,14 @@ private:
                     this->encoder->time_base = this->inFile->streams[this->videoIndex]->time_base;
                     this->encoder->pix_fmt = config->pix_fmt;
                     this->encoder->hw_device_ctx = hwDevice;
-                    this->encoder->sw_pix_fmt = format;
+                    this->encoder->sw_pix_fmt = sw;
 
                     AVBufferRef *hwBufferRef = av_hwframe_ctx_alloc(hwDevice);
                     AVHWFramesContext *hwFramesCtx = (AVHWFramesContext *)hwBufferRef->data;
                     hwFramesCtx->format = config->pix_fmt;
                     hwFramesCtx->width = this->encoder->width;
                     hwFramesCtx->height = this->encoder->height;
-                    hwFramesCtx->sw_format = format;
+                    hwFramesCtx->sw_format = sw;
 
                     if (av_hwframe_ctx_init(hwBufferRef) < 0)
                     {
@@ -507,8 +517,11 @@ private:
                         // reset
                         avcodec_free_context(&this->encoder);
                         this->encoder = nullptr;
+
+                        // set the hw stuff and then return
                         this->encoder = avcodec_alloc_context3(this->encoderCodec);
                         this->hwEncoder = true;
+                        this->swFormat = sw;
                         return;
                     }
 
@@ -559,6 +572,8 @@ public:
                 this->raiseError("Encoder already initialised");
         }
 
+        this->swFormat = format;
+
         // force even for compatibility for specific encode codecs (h264)
         width &= ~1;
         height &= ~1;
@@ -568,7 +583,7 @@ public:
 
         if (useHardware)
             // this will make hwEncoder true if theres one available
-            this->findHwEncoder(width, height, format, codecId);
+            this->findHwEncoder(width, height, codecId);
 
         // if we are not using hwEncoder, we fallback to software
         if (!this->hwEncoder)
@@ -595,11 +610,9 @@ public:
                 this->raiseError("Failed to find encoder");
         }
 
-        cout << this->encoderCodec->name << endl;
-
         this->encoder->width = width;
         this->encoder->height = height;
-        this->encoder->pix_fmt = format;
+        this->encoder->pix_fmt = this->swFormat;
         this->encoder->max_b_frames = 0;
         this->encoder->flags = 0;
 
@@ -674,16 +687,14 @@ public:
             // change some of the encoder parameters
             this->encoder->pix_fmt = config->pix_fmt;
             this->encoder->hw_device_ctx = hwDevice;
-            this->encoder->sw_pix_fmt = format;
-
-            cout << "format " << av_pix_fmt_desc_get(format)->name << endl;
+            this->encoder->sw_pix_fmt = this->swFormat;
 
             AVBufferRef *hwBufferRef = av_hwframe_ctx_alloc(hwDevice);
             AVHWFramesContext *hwFramesCtx = (AVHWFramesContext *)hwBufferRef->data;
             hwFramesCtx->format = config->pix_fmt;
             hwFramesCtx->width = this->encoder->width;
             hwFramesCtx->height = this->encoder->height;
-            hwFramesCtx->sw_format = format;
+            hwFramesCtx->sw_format = this->swFormat;
             if ((code = av_hwframe_ctx_init(hwBufferRef)) != 0)
                 this->raiseError("Unexpected error in initialising hardware encoder", code);
 
@@ -708,6 +719,29 @@ public:
         // prepare frame for hw encoder
         if (this->hwEncoder)
         {
+            // convert the frame to swFormat supported by hwEncoder first
+            if (frame->format != this->swFormat)
+            {
+                AVFrame *swFrame = av_frame_alloc();
+                swFrame->format = this->swFormat;
+                swFrame->width = frame->width;
+                swFrame->height = frame->height;
+                av_frame_get_buffer(swFrame, 0);
+
+                SwsContext *swsCtx = sws_getContext(frame->width, frame->height, (enum AVPixelFormat)frame->format,
+                                                    frame->width, frame->height, this->swFormat,
+                                                    SWS_BILINEAR, nullptr, nullptr, nullptr);
+
+                sws_scale(swsCtx, frame->data, frame->linesize, 0, frame->height,
+                          swFrame->data, swFrame->linesize);
+
+                sws_freeContext(swsCtx);
+
+                av_frame_copy_props(swFrame, frame);
+                av_frame_free(&frame);
+                frame = swFrame;
+            }
+
             AVFrame *hwFrame = av_frame_alloc();
             hwFrame->format = this->encoder->pix_fmt;
             hwFrame->width = this->encoder->width;
@@ -726,6 +760,8 @@ public:
                 av_frame_free(&hwFrame);
                 this->raiseError("Failed to convert software frame to hardware frame", code);
             }
+
+            av_frame_copy_props(hwFrame, frame);
 
             av_frame_free(&frame);
             frame = hwFrame;
@@ -930,5 +966,10 @@ public:
     int getMisplaceFrameCount()
     {
         return this->misplaceFramesCount;
+    }
+
+    string getEncoder()
+    {
+        return this->encoder->codec->name;
     }
 };

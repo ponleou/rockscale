@@ -42,6 +42,7 @@ using std::pair;
 using std::priority_queue;
 using std::queue;
 using std::setprecision;
+using std::stof;
 using std::stoi;
 using std::string;
 using std::unique_lock;
@@ -250,6 +251,7 @@ struct FlagOptions
     int halfWindow;
     int device;
     int unsafeThreads;
+    bool hardwareEncode;
 };
 
 void unknownFlag(const char *flag)
@@ -273,8 +275,9 @@ void printHelp(const char *programName)
     cout << "  -o, --output <file>         Output video file\n";
     cout << "  -s, --scaling <int>         Scaling factor (integer)\n";
     cout << "  -t, --type <mode>           Upscaling interpolation type (\"bilinear\", \"bicubic\", or \"lanczos\")\n";
-    cout << "  -hw, --half-window <int>    Half-window size, only in use for \"lanczos\" interpolation type (integer, default: 5)\n";
+    cout << "  -w, --window <int>          Window size, only in use for \"lanczos\" interpolation type (integer, default: 10)\n";
     cout << "  -d, --device <int>          Device index to use (integer, default: 0)\n";
+    cout << "  -hwe, --hardware-encode     Use hardware acceleration for encoding (default: disabled)\n";
     cout << "  -ut, --unsafe-threads <int> Number of threads, may be faster but causes frame misplacement, keep at default for safe value (integer, default: 1)\n";
 
     exit(0);
@@ -286,6 +289,7 @@ void checkFlags(int argc, char *argv[], FlagOptions &flags)
     flags.device = 0;
     flags.unsafeThreads = 1;
     flags.halfWindow = 5;
+    flags.hardwareEncode = false;
 
     // required flags
     bool input = false;
@@ -336,16 +340,16 @@ void checkFlags(int argc, char *argv[], FlagOptions &flags)
 
             type = true;
         }
-        else if (strcmp(argv[i], "-hw") == 0 || strcmp(argv[i], "--half-window") == 0)
+        else if (strcmp(argv[i], "-w") == 0 || strcmp(argv[i], "--window") == 0)
         {
             i++;
             try
             {
-                flags.halfWindow = stoi(argv[i]);
+                flags.halfWindow = floor(stof(argv[i]) / 2.0);
             }
             catch (invalid_argument)
             {
-                unknownValue("--half-window", argv[i], "integer");
+                unknownValue("--window", argv[i], "integer");
             }
         }
         else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--device") == 0)
@@ -359,6 +363,10 @@ void checkFlags(int argc, char *argv[], FlagOptions &flags)
             {
                 unknownValue("--device", argv[i], "integer");
             }
+        }
+        else if (strcmp(argv[i], "-hwe") == 0 || strcmp(argv[i], "--hardware-encode") == 0)
+        {
+            flags.hardwareEncode = true;
         }
         else if (strcmp(argv[i], "-ut") == 0 || strcmp(argv[i], "--unsafe-threads") == 0)
         {
@@ -407,6 +415,7 @@ int main(int argc, char *argv[])
     const char *output = settings.output;
     Interpolation type = settings.type;
     int halfWindow = settings.halfWindow;
+    bool hardwareEncode = settings.hardwareEncode;
 
     int maxProcessor = usableThreads - 2;
     int processorThreads = min(settings.unsafeThreads, maxProcessor);
@@ -429,7 +438,6 @@ int main(int argc, char *argv[])
 
     hipDeviceProp_t prop;
     HIP_CHECK(hipGetDeviceProperties(&prop, settings.device))
-    cout << "Device " << settings.device << ": " << prop.name << endl;
 
     // 4 is a good multiplier, idk tho, if u want accuracy, just make it slower
     int batchSize = processorThreads * 4;
@@ -440,11 +448,15 @@ int main(int argc, char *argv[])
     int scaledHeight = dimension.second * scale;
     AVPixelFormat format = convertToYUV(video.getPixelFormat());
 
-    // TODO: use hardware encoding when feature is finished
-    video.initialiseEncoder(scaledWidth, scaledHeight, format, false, encoderThreads);
+    video.initialiseEncoder(scaledWidth, scaledHeight, format, hardwareEncode, encoderThreads);
 
     int threadCount = min(usableThreads, processorThreads + 2); // +2 because one for consumer one for producer
     ThreadTask threads(threadCount - 1);                        // -1 because producer is running in main thread
+
+    cout << "Device " << settings.device << ": " << prop.name << endl;
+    cout << "Decoder: " << video.getDecoder() << endl;
+    cout << "Encoder: " << video.getEncoder() << endl;
+    cout << endl;
 
     cout << "Max concurrency threads: " << MAX_THREADS << " threads" << endl;
     cout << "Using " << usableThreads << " threads, " << decoderThreads << " decoder threads, " << processorThreads << " processor threads, " << encoderThreads << " encoder threads" << endl;
