@@ -9,7 +9,7 @@ extern "C"
 #include "interpolations/bilinear.hpp"
 #include "interpolations/bicubic.hpp"
 #include "interpolations/lanczos.hpp"
-#include "utils/video.hpp"
+#include "utils/video.hpp" // FIXME: experimental
 #include "utils/logger.hpp"
 
 #include <mutex>
@@ -148,7 +148,7 @@ struct ProcessorOptions : InterpolationOptions
     Interpolation interpolation;
 };
 
-void postInterpolation(VideoFFmpeg &video, AVFrame *&frame, AVPixelFormat format, Logger *logger = nullptr, int line = 0, int *frameCount = nullptr)
+void postInterpolation(VideoPipeline &video, AVFrame *&frame, AVPixelFormat format, Logger *logger = nullptr, int line = 0, int *frameCount = nullptr)
 {
     *frameCount += 1;
     if (logger != nullptr)
@@ -158,7 +158,7 @@ void postInterpolation(VideoFFmpeg &video, AVFrame *&frame, AVPixelFormat format
     frame = video.getFrame(format);
 }
 
-void interpolateVideo(VideoFFmpeg &video, Interpolation type, InterpolationOptions &options, Logger *logger = nullptr, int line = 0)
+void interpolateVideo(VideoPipeline &video, Interpolation type, InterpolationOptions &options, Logger *logger = nullptr, int line = 0)
 {
     int frameCount = 0;
     AVFrame *frame = video.getFrame(options.format);
@@ -205,17 +205,17 @@ void interpolateVideo(VideoFFmpeg &video, Interpolation type, InterpolationOptio
     HIP_CHECK(hipStreamDestroy(stream));
 }
 
-void processor(VideoFFmpeg &video, ProcessorOptions &options, Logger &logger, int threadNum)
+void processor(VideoPipeline &video, ProcessorOptions &options, Logger &logger, int threadNum)
 {
     interpolateVideo(video, options.interpolation, options, &logger, threadNum + 2);
 }
 
-void producer(VideoFFmpeg &video, int scale, Logger &logger, int threadNum)
+void producer(VideoPipeline &video, int scale, Logger &logger, int threadNum)
 {
     video.startDecode(&logger, threadNum + 2);
 }
 
-void consumer(VideoFFmpeg &video, const char *fileName, float thresholdLevel, Logger &logger, int threadNum)
+void consumer(VideoPipeline &video, const char *fileName, float thresholdLevel, Logger &logger, int threadNum)
 {
     video.startEncode(fileName, thresholdLevel, &logger, threadNum + 2);
 }
@@ -433,7 +433,7 @@ int main(int argc, char *argv[])
 
     // 4 is a good multiplier, idk tho, if u want accuracy, just make it slower
     int batchSize = processorThreads * 4;
-    VideoFFmpeg video(input, batchSize, decoderThreads);
+    VideoPipeline video(input, batchSize, decoderThreads);
 
     pair<int, int> dimension = video.getDimension();
     int scaledWidth = dimension.first * scale;
@@ -441,7 +441,7 @@ int main(int argc, char *argv[])
     AVPixelFormat format = convertToYUV(video.getPixelFormat());
 
     // TODO: use hardware encoding when feature is finished
-    video.initialiseEncoder(scaledWidth, scaledHeight, format, true, encoderThreads);
+    video.initialiseEncoder(scaledWidth, scaledHeight, format, false, encoderThreads);
 
     int threadCount = min(usableThreads, processorThreads + 2); // +2 because one for consumer one for producer
     ThreadTask threads(threadCount - 1);                        // -1 because producer is running in main thread
