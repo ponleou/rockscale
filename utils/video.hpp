@@ -196,7 +196,7 @@ public:
                     }
                 }
 
-                // FIXME: might fail when recvcode was EOF
+                // NOTE: might fail when recvcode was EOF
                 if (sendCode != 0)
                     this->raiseError("Failed to decode frame", sendCode);
             }
@@ -279,12 +279,13 @@ public:
         return convertedFrame;
     }
 
-    string getDecoder()
+    string getDecoderCodec()
     {
         return this->decoder->codec->name;
     }
 };
 
+// adds encoding
 class VideoPipeline : public VideoDecoder
 {
 private:
@@ -304,19 +305,19 @@ private:
     const AVCodec *encoderCodec;
     AVCodecContext *encoder;
     condition_variable encoderCV;
-    AVHWFramesContext *hwFramesCtx;
-    bool hwEncoder;
 
-    AVPixelFormat swFormat;
+    AVPixelFormat swFormat; // the format that the frames come from (in the host, or software)
 
     priority_queue<AVFrame *, vector<AVFrame *>, ComparePTS> encodeBuffer;
     mutex ebufferLocker; // NOTE: must mutex encoderInitialised and encodeBuffer
     condition_variable ebufferCV;
 
+    bool hwEncoder; // if its using a hardware encoder
+
     bool encoderInitialised;
-    int encodeFramesCount;
     bool encodeEnded;
 
+    int encodeFramesCount;
     int misplaceFramesCount;
 
     // interleaved packets until we put the passed videopacket, then we return and wait for the next ones
@@ -458,8 +459,6 @@ private:
         return frame;
     }
 
-    // FIXME: this is not finished yet, nearly none of the hardware encoders use YUV pixel format
-    // this is a WIP
     void findHwEncoder(int width, int height, AVCodecID codecId)
     {
         // FIXME: hardcoded NV12 format
@@ -500,6 +499,7 @@ private:
                     hwFramesCtx->height = this->encoder->height;
                     hwFramesCtx->sw_format = sw;
 
+                    // if failed, reset, and go to next codec
                     if (av_hwframe_ctx_init(hwBufferRef) < 0)
                     {
                         av_buffer_unref(&hwBufferRef);
@@ -642,7 +642,7 @@ public:
 
         float fps = av_q2d(this->encoder->framerate);
 
-        // TODO: NOTE: i honestly have no idea what GOP size is, this is purely AI generated
+        // NOTE: i honestly have no idea what GOP size is, this is purely AI generated
         // Set appropriate GOP size for different codecs
         if (this->encoderCodec->id == AV_CODEC_ID_H264 || this->encoderCodec->id == AV_CODEC_ID_H265)
         {
@@ -699,8 +699,6 @@ public:
                 this->raiseError("Unexpected error in initialising hardware encoder", code);
 
             this->encoder->hw_frames_ctx = hwBufferRef;
-
-            this->hwFramesCtx = hwFramesCtx;
         }
 
         unique_lock<mutex> lock(this->ebufferLocker);
@@ -821,7 +819,6 @@ public:
                 }
 
                 // if its empty and ended, break, theres a step at the end that works with any remaining frames in the buffer
-                // TODO: might need to remove empty check
                 if (this->encodeEnded && this->encodeBuffer.empty())
                     break;
 
@@ -968,7 +965,7 @@ public:
         return this->misplaceFramesCount;
     }
 
-    string getEncoder()
+    string getEncoderCodec()
     {
         return this->encoder->codec->name;
     }

@@ -9,7 +9,7 @@ extern "C"
 #include "interpolations/bilinear.hpp"
 #include "interpolations/bicubic.hpp"
 #include "interpolations/lanczos.hpp"
-#include "utils/video.hpp" // FIXME: experimental
+#include "utils/video.hpp"
 #include "utils/logger.hpp"
 
 #include <mutex>
@@ -25,6 +25,7 @@ extern "C"
 #include <utility>
 #include <algorithm>
 #include <iomanip>
+#include <map>
 using std::function;
 using std::thread;
 using namespace std::chrono;
@@ -34,7 +35,9 @@ using std::cout;
 using std::endl;
 using std::fixed;
 using std::flush;
+using std::left;
 using std::logic_error;
+using std::map;
 using std::max;
 using std::min;
 using std::mutex;
@@ -42,6 +45,7 @@ using std::pair;
 using std::priority_queue;
 using std::queue;
 using std::setprecision;
+using std::setw;
 using std::stof;
 using std::stoi;
 using std::string;
@@ -250,8 +254,92 @@ struct FlagOptions
     Interpolation type;
     int halfWindow;
     int device;
-    int unsafeThreads;
     bool hardwareEncode;
+    int unsafeProcessThreads;
+    int decodeThreads;
+    int encodeThreads;
+};
+
+struct Flags
+{
+    enum class OPTION_POS
+    {
+        FULL,
+        SHORT,
+        TYPE,
+        DESC,
+    };
+
+    enum OPTION_ORDER
+    {
+        HELP,
+        INPUT,
+        OUTPUT,
+        SCALING,
+        TYPE,
+        WINDOW,
+        DEVICE,
+        HARDWARE_ENCODE,
+        UNSAFE_PROCESS_THREADS,
+        DECODE_THREADS,
+        ENCODE_THREADS,
+    };
+
+    inline static vector<map<OPTION_POS, string>> options = {
+        {{OPTION_POS::SHORT, "-h"},
+         {OPTION_POS::FULL, "--help"},
+         {OPTION_POS::TYPE, ""},
+         {OPTION_POS::DESC, "Show this help message and exit"}},
+
+        {{OPTION_POS::SHORT, "-i"},
+         {OPTION_POS::FULL, "--input"},
+         {OPTION_POS::TYPE, "<string>"},
+         {OPTION_POS::DESC, "Input video file"}},
+
+        {{OPTION_POS::SHORT, "-o"},
+         {OPTION_POS::FULL, "--output"},
+         {OPTION_POS::TYPE, "<string>"},
+         {OPTION_POS::DESC, "Output video file"}},
+
+        {{OPTION_POS::SHORT, "-s"},
+         {OPTION_POS::FULL, "--scaling"},
+         {OPTION_POS::TYPE, "<int>"},
+         {OPTION_POS::DESC, "Scaling factor (integer, > 1)"}},
+
+        {{OPTION_POS::SHORT, "-t"},
+         {OPTION_POS::FULL, "--type"},
+         {OPTION_POS::TYPE, "<string>"},
+         {OPTION_POS::DESC, "Upscaling interpolation type (\"bilinear\", \"bicubic\", or \"lanczos\")"}},
+
+        {{OPTION_POS::SHORT, "-w"},
+         {OPTION_POS::FULL, "--window"},
+         {OPTION_POS::TYPE, "<int>"},
+         {OPTION_POS::DESC, "Window size, only for \"lanczos\" interpolation (integer, > 1, default: 10)"}},
+
+        {{OPTION_POS::SHORT, "-d"},
+         {OPTION_POS::FULL, "--device"},
+         {OPTION_POS::TYPE, "<int>"},
+         {OPTION_POS::DESC, "Device index to use (integer, default: 0)"}},
+
+        {{OPTION_POS::SHORT, "-hwe"},
+         {OPTION_POS::FULL, "--hardware-encode"},
+         {OPTION_POS::TYPE, ""},
+         {OPTION_POS::DESC, "Use hardware acceleration for encoding (default: disabled)"}},
+
+        {{OPTION_POS::SHORT, "-upt"},
+         {OPTION_POS::FULL, "--unsafe-process-threads"},
+         {OPTION_POS::TYPE, "<int>"},
+         {OPTION_POS::DESC, "Number of threads for processor, may be faster but may cause frame misplacements (integer, > 0, default: 1)"}},
+
+        {{OPTION_POS::SHORT, "-dt"},
+         {OPTION_POS::FULL, "--decode-threads"},
+         {OPTION_POS::TYPE, "<int>"},
+         {OPTION_POS::DESC, "Number of threads for decoder (integer, > 0, default: 1)"}},
+
+        {{OPTION_POS::SHORT, "-et"},
+         {OPTION_POS::FULL, "--uencode-threads"},
+         {OPTION_POS::TYPE, "<int>"},
+         {OPTION_POS::DESC, "Number of threads for encoder (integer, > 0, default: automatic)"}}};
 };
 
 void unknownFlag(const char *flag)
@@ -260,9 +348,9 @@ void unknownFlag(const char *flag)
     exit(1);
 }
 
-void unknownValue(string flag, const char *value, string expected)
+void unknownValue(map<Flags::OPTION_POS, string> option, const char *value, string expected)
 {
-    cout << "Error: unknown value for " << flag << " flag: " << "\"" << value << "\"" << ", expected " << expected << endl;
+    cout << "Error: unknown value for " << option[Flags::OPTION_POS::SHORT] << ", " << option[Flags::OPTION_POS::FULL] << " flag: " << "\"" << value << "\"" << ", expected " << expected << endl;
     exit(1);
 }
 
@@ -270,26 +358,46 @@ void printHelp(const char *programName)
 {
     cout << "Usage: " << programName << " [options]\n\n";
     cout << "Options:\n";
-    cout << "  -h, --help                  Show this help message and exit\n";
-    cout << "  -i, --input <file>          Input video file\n";
-    cout << "  -o, --output <file>         Output video file\n";
-    cout << "  -s, --scaling <int>         Scaling factor (integer)\n";
-    cout << "  -t, --type <mode>           Upscaling interpolation type (\"bilinear\", \"bicubic\", or \"lanczos\")\n";
-    cout << "  -w, --window <int>          Window size, only in use for \"lanczos\" interpolation type (integer, default: 10)\n";
-    cout << "  -d, --device <int>          Device index to use (integer, default: 0)\n";
-    cout << "  -hwe, --hardware-encode     Use hardware acceleration for encoding (default: disabled)\n";
-    cout << "  -ut, --unsafe-threads <int> Number of threads, may be faster but causes frame misplacement, keep at default for safe value (integer, default: 1)\n";
+
+    size_t maxShortFull = 0;
+    for (auto &flag : Flags::options)
+    {
+        size_t len = flag[Flags::OPTION_POS::SHORT].length() + 2 + flag[Flags::OPTION_POS::FULL].length() + 1 + flag[Flags::OPTION_POS::TYPE].length();
+        if (len > maxShortFull)
+            maxShortFull = len;
+    }
+
+    const int extraGap = 3;
+
+    for (auto &flag : Flags::options)
+    {
+        string shortFull = flag[Flags::OPTION_POS::SHORT] + ", " + flag[Flags::OPTION_POS::FULL] + " " + flag[Flags::OPTION_POS::TYPE];
+        cout << "  "
+             << left << setw(maxShortFull + extraGap) << shortFull
+             << flag[Flags::OPTION_POS::DESC] << endl;
+    }
 
     exit(0);
 }
 
+bool checkFlagCondition(const char *arg, map<Flags::OPTION_POS, string> option)
+{
+    return strcmp(arg, option[Flags::OPTION_POS::SHORT].c_str()) == 0 || strcmp(arg, option[Flags::OPTION_POS::FULL].c_str()) == 0;
+}
+
 void checkFlags(int argc, char *argv[], FlagOptions &flags)
 {
+    auto options = Flags::options;
+
     // default values
     flags.device = 0;
-    flags.unsafeThreads = 1;
+    flags.unsafeProcessThreads = 1;
     flags.halfWindow = 5;
     flags.hardwareEncode = false;
+    flags.decodeThreads = 1;
+
+    // unused default, default to automatic
+    flags.encodeThreads = -1;
 
     // required flags
     bool input = false;
@@ -299,34 +407,37 @@ void checkFlags(int argc, char *argv[], FlagOptions &flags)
 
     for (int i = 1; i < argc; i++)
     {
-        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0)
+        if (checkFlagCondition(argv[i], options[Flags::HELP]))
             printHelp(argv[0]);
-        else if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--input") == 0)
+        else if (checkFlagCondition(argv[i], options[Flags::INPUT]))
         {
             i++;
             flags.input = argv[i];
             input = true;
         }
-        else if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0)
+        else if (checkFlagCondition(argv[i], options[Flags::OUTPUT]))
         {
             i++;
             flags.output = argv[i];
             output = true;
         }
-        else if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--scaling") == 0)
+        else if (checkFlagCondition(argv[i], options[Flags::SCALING]))
         {
             i++;
             try
             {
                 flags.scale = stoi(argv[i]);
+
+                if (!(flags.scale > 1))
+                    unknownValue(options[Flags::SCALING], argv[i], "integer, must be more than 1");
             }
             catch (invalid_argument)
             {
-                unknownValue("--scaling", argv[i], "integer");
+                unknownValue(options[Flags::SCALING], argv[i], "integer, > 1");
             }
             scaling = true;
         }
-        else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--type") == 0)
+        else if (checkFlagCondition(argv[i], options[Flags::TYPE]))
         {
             i++;
             if (strcmp(argv[i], "bilinear") == 0)
@@ -336,23 +447,28 @@ void checkFlags(int argc, char *argv[], FlagOptions &flags)
             else if (strcmp(argv[i], "lanczos") == 0)
                 flags.type = LANCZOS;
             else
-                unknownValue("--type", argv[i], "\"bilinear\", \"bicubic\", or \"lanczos\"");
+                unknownValue(options[Flags::TYPE], argv[i], "\"bilinear\", \"bicubic\", or \"lanczos\"");
 
             type = true;
         }
-        else if (strcmp(argv[i], "-w") == 0 || strcmp(argv[i], "--window") == 0)
+        else if (checkFlagCondition(argv[i], options[Flags::WINDOW]))
         {
             i++;
             try
             {
+                int window = stof(argv[i]);
+
                 flags.halfWindow = floor(stof(argv[i]) / 2.0);
+
+                if (!(flags.halfWindow > 0))
+                    unknownValue(options[Flags::WINDOW], argv[i], "integer, must be more than 1");
             }
             catch (invalid_argument)
             {
-                unknownValue("--window", argv[i], "integer");
+                unknownValue(options[Flags::WINDOW], argv[i], "integer");
             }
         }
-        else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--device") == 0)
+        else if (checkFlagCondition(argv[i], options[Flags::DEVICE]))
         {
             i++;
             try
@@ -361,23 +477,56 @@ void checkFlags(int argc, char *argv[], FlagOptions &flags)
             }
             catch (invalid_argument)
             {
-                unknownValue("--device", argv[i], "integer");
+                unknownValue(options[Flags::DEVICE], argv[i], "integer");
             }
         }
-        else if (strcmp(argv[i], "-hwe") == 0 || strcmp(argv[i], "--hardware-encode") == 0)
+        else if (checkFlagCondition(argv[i], options[Flags::HARDWARE_ENCODE]))
         {
             flags.hardwareEncode = true;
         }
-        else if (strcmp(argv[i], "-ut") == 0 || strcmp(argv[i], "--unsafe-threads") == 0)
+        else if (checkFlagCondition(argv[i], options[Flags::UNSAFE_PROCESS_THREADS]))
         {
             i++;
             try
             {
-                flags.unsafeThreads = stoi(argv[i]);
+                flags.unsafeProcessThreads = stoi(argv[i]);
+
+                if (!(flags.unsafeProcessThreads > 0))
+                    unknownValue(options[Flags::UNSAFE_PROCESS_THREADS], argv[i], "integer, must be more than 0");
             }
             catch (invalid_argument)
             {
-                unknownValue("--unsafe-threads", argv[i], "integer");
+                unknownValue(options[Flags::UNSAFE_PROCESS_THREADS], argv[i], "integer");
+            }
+        }
+        else if (checkFlagCondition(argv[i], options[Flags::DECODE_THREADS]))
+        {
+            i++;
+            try
+            {
+                flags.decodeThreads = stoi(argv[i]);
+
+                if (!(flags.decodeThreads > 0))
+                    unknownValue(options[Flags::DECODE_THREADS], argv[i], "integer, must be more than 0");
+            }
+            catch (invalid_argument)
+            {
+                unknownValue(options[Flags::DECODE_THREADS], argv[i], "integer");
+            }
+        }
+        else if (checkFlagCondition(argv[i], options[Flags::ENCODE_THREADS]))
+        {
+            i++;
+            try
+            {
+                flags.encodeThreads = stoi(argv[i]);
+
+                if (!(flags.encodeThreads > 0))
+                    unknownValue(options[Flags::ENCODE_THREADS], argv[i], "integer, must be more than 0");
+            }
+            catch (invalid_argument)
+            {
+                unknownValue(options[Flags::ENCODE_THREADS], argv[i], "integer");
             }
         }
         else
@@ -418,13 +567,15 @@ int main(int argc, char *argv[])
     bool hardwareEncode = settings.hardwareEncode;
 
     int maxProcessor = usableThreads - 2;
-    int processorThreads = min(settings.unsafeThreads, maxProcessor);
+    int processorThreads = min(settings.unsafeProcessThreads, maxProcessor);
 
     float remainingThreads = usableThreads - processorThreads;
     // decoding is not the bottleneck
-    int decoderThreads = 1;
+    int decoderThreads = max(1, settings.decodeThreads);
     // encoding is the main bottleneck, we will give it all remaining threads
     int encoderThreads = remainingThreads - decoderThreads;
+    if (settings.encodeThreads > 0)
+        encoderThreads = settings.encodeThreads;
 
     int deviceCount;
     HIP_CHECK(hipGetDeviceCount(&deviceCount));
@@ -454,14 +605,15 @@ int main(int argc, char *argv[])
     ThreadTask threads(threadCount - 1);                        // -1 because producer is running in main thread
 
     cout << "========== DEVICES ==========" << endl;
-    cout << "Decoder: " << video.getDecoder() << endl;
+    cout << "Decoder: " << video.getDecoderCodec() << endl;
     cout << "Processor device " << settings.device << ": " << prop.name << endl;
-    cout << "Encoder: " << video.getEncoder() << endl;
+    cout << "Encoder: " << video.getEncoderCodec() << endl;
     cout << endl;
 
     cout << "========== SETTINGS ==========" << endl;
     cout << "Max concurrency threads: " << MAX_THREADS << " threads" << endl;
-    cout << "Using " << usableThreads << " threads, " << decoderThreads << " decoder threads, " << processorThreads << " processor threads, " << encoderThreads << " encoder threads" << endl;
+    cout << "Using " << (decoderThreads + processorThreads + encoderThreads)
+         << " threads: " << decoderThreads << " decoder threads, " << processorThreads << " processor threads, " << encoderThreads << " encoder threads" << endl;
 
     Logger logger;
     cout << endl;
