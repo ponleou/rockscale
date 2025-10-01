@@ -337,7 +337,7 @@ struct Flags
          {OPTION_POS::DESC, "Number of threads for decoder (integer, > 0, default: 1)"}},
 
         {{OPTION_POS::SHORT, "-et"},
-         {OPTION_POS::FULL, "--uencode-threads"},
+         {OPTION_POS::FULL, "--encode-threads"},
          {OPTION_POS::TYPE, "<int>"},
          {OPTION_POS::DESC, "Number of threads for encoder (integer, > 0, default: automatic)"}}};
 };
