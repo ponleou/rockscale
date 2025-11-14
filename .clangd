@@ -1,0 +1,6 @@
+CompileFlags:
+  Add: 
+    - -D__INTELLISENSE__
+    - -D__HIP_PLATFORM_AMD__
+    - -D__HIP_PLATFORM_HCC__
+  Compiler: /opt/rocm/bin/hipcc
